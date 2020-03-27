@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/diff"
+	utilpointer "k8s.io/utils/pointer"
 
 	prowapi "k8s.io/test-infra/prow/apis/prowjobs/v1"
 	"k8s.io/test-infra/prow/clonerefs"
@@ -58,6 +59,16 @@ func TestCloneRefs(t *testing.T) {
 	codeMount := coreapi.VolumeMount{
 		Name:      "code",
 		MountPath: "/code-mount",
+	}
+	tmpMount := coreapi.VolumeMount{
+		Name:      "clonerefs-tmp",
+		MountPath: "/tmp",
+	}
+	tmpVolume := coreapi.Volume{
+		Name: "clonerefs-tmp",
+		VolumeSource: coreapi.VolumeSource{
+			EmptyDir: &coreapi.EmptyDirVolumeSource{},
+		},
 	}
 	envOrDie := func(opt clonerefs.Options) []coreapi.EnvVar {
 		e, err := cloneEnv(opt)
@@ -187,8 +198,9 @@ func TestCloneRefs(t *testing.T) {
 					SrcRoot:      codeMount.MountPath,
 					Log:          CloneLogPath(logMount),
 				}),
-				VolumeMounts: []coreapi.VolumeMount{logMount, codeMount},
+				VolumeMounts: []coreapi.VolumeMount{logMount, codeMount, tmpMount},
 			},
+			volumes: []coreapi.Volume{tmpVolume},
 		},
 		{
 			name: "create clonerefs containers when extrarefs are set",
@@ -210,8 +222,9 @@ func TestCloneRefs(t *testing.T) {
 					SrcRoot:      codeMount.MountPath,
 					Log:          CloneLogPath(logMount),
 				}),
-				VolumeMounts: []coreapi.VolumeMount{logMount, codeMount},
+				VolumeMounts: []coreapi.VolumeMount{logMount, codeMount, tmpMount},
 			},
+			volumes: []coreapi.Volume{tmpVolume},
 		},
 		{
 			name: "append extrarefs after refs",
@@ -234,8 +247,9 @@ func TestCloneRefs(t *testing.T) {
 					SrcRoot:      codeMount.MountPath,
 					Log:          CloneLogPath(logMount),
 				}),
-				VolumeMounts: []coreapi.VolumeMount{logMount, codeMount},
+				VolumeMounts: []coreapi.VolumeMount{logMount, codeMount, tmpMount},
 			},
+			volumes: []coreapi.Volume{tmpVolume},
 		},
 		{
 			name: "append ssh secrets when set",
@@ -264,9 +278,10 @@ func TestCloneRefs(t *testing.T) {
 					codeMount,
 					sshMountOnly("super"),
 					sshMountOnly("secret"),
+					tmpMount,
 				},
 			},
-			volumes: []coreapi.Volume{sshVolumeOnly("super"), sshVolumeOnly("secret")},
+			volumes: []coreapi.Volume{sshVolumeOnly("super"), sshVolumeOnly("secret"), tmpVolume},
 		},
 		{
 			name: "include ssh host fingerprints when set",
@@ -290,8 +305,9 @@ func TestCloneRefs(t *testing.T) {
 					HostFingerprints: []string{"thumb", "pinky"},
 					Log:              CloneLogPath(logMount),
 				}),
-				VolumeMounts: []coreapi.VolumeMount{logMount, codeMount},
+				VolumeMounts: []coreapi.VolumeMount{logMount, codeMount, tmpMount},
 			},
+			volumes: []coreapi.Volume{tmpVolume},
 		},
 		{
 			name: "include cookiefile secrets when set",
@@ -316,9 +332,53 @@ func TestCloneRefs(t *testing.T) {
 					SrcRoot:      codeMount.MountPath,
 					Log:          CloneLogPath(logMount),
 				}),
-				VolumeMounts: []coreapi.VolumeMount{logMount, codeMount, cookieMountOnly("oatmeal")},
+				VolumeMounts: []coreapi.VolumeMount{logMount, codeMount, tmpMount, cookieMountOnly("oatmeal")},
 			},
-			volumes: []coreapi.Volume{cookieVolumeOnly("oatmeal")},
+			volumes: []coreapi.Volume{tmpVolume, cookieVolumeOnly("oatmeal")},
+		},
+		{
+			name: "include oauth token secret when set",
+			pj: prowapi.ProwJob{
+				Spec: prowapi.ProwJobSpec{
+					ExtraRefs: []prowapi.Refs{{}},
+					DecorationConfig: &prowapi.DecorationConfig{
+						UtilityImages: &prowapi.UtilityImages{},
+						OauthTokenSecret: &prowapi.OauthTokenSecret{
+							Name: "oauth-secret",
+							Key:  "oauth-file",
+						},
+					},
+				},
+			},
+			expected: &coreapi.Container{
+				Name:    cloneRefsName,
+				Command: []string{cloneRefsCommand},
+				Env: envOrDie(clonerefs.Options{
+					GitRefs:        []prowapi.Refs{{}},
+					GitUserEmail:   clonerefs.DefaultGitUserEmail,
+					GitUserName:    clonerefs.DefaultGitUserName,
+					SrcRoot:        codeMount.MountPath,
+					Log:            CloneLogPath(logMount),
+					OauthTokenFile: "/secrets/oauth/oauth-token",
+				}),
+				VolumeMounts: []coreapi.VolumeMount{logMount, codeMount,
+					{Name: "oauth-secret-oauth-secret", ReadOnly: true, MountPath: "/secrets/oauth"}, tmpMount,
+				},
+			},
+			volumes: []coreapi.Volume{
+				{
+					Name: "oauth-secret-oauth-secret",
+					VolumeSource: coreapi.VolumeSource{
+						Secret: &coreapi.SecretVolumeSource{
+							SecretName: "oauth-secret",
+							Items: []coreapi.KeyToPath{{
+								Key:  "oauth-file",
+								Path: "./oauth-token"}},
+						},
+					},
+				},
+				tmpVolume,
+			},
 		},
 	}
 
@@ -365,10 +425,11 @@ func TestProwJobToPod(t *testing.T) {
 	falseth := false
 	var sshKeyMode int32 = 0400
 	tests := []struct {
-		podName string
-		buildID string
-		labels  map[string]string
-		pjSpec  prowapi.ProwJobSpec
+		podName  string
+		buildID  string
+		labels   map[string]string
+		pjSpec   prowapi.ProwJobSpec
+		pjStatus prowapi.ProwJobStatus
 
 		expected *coreapi.Pod
 	}{
@@ -402,6 +463,9 @@ func TestProwJobToPod(t *testing.T) {
 					},
 				},
 			},
+			pjStatus: prowapi.ProwJobStatus{
+				BuildID: "blabla",
+			},
 
 			expected: &coreapi.Pod{
 				ObjectMeta: metav1.ObjectMeta{
@@ -415,6 +479,7 @@ func TestProwJobToPod(t *testing.T) {
 						kube.RepoLabel:         "repo-name",
 						kube.PullLabel:         "1",
 						kube.ProwJobAnnotation: "job-name",
+						kube.ProwBuildIDLabel:  "blabla",
 					},
 					Annotations: map[string]string{
 						kube.ProwJobAnnotation: "job-name",
@@ -431,6 +496,7 @@ func TestProwJobToPod(t *testing.T) {
 								{Name: "MY_ENV", Value: "rocks"},
 								{Name: "BUILD_ID", Value: "blabla"},
 								{Name: "BUILD_NUMBER", Value: "blabla"},
+								{Name: "CI", Value: "true"},
 								{Name: "JOB_NAME", Value: "job-name"},
 								{Name: "JOB_SPEC", Value: `{"type":"presubmit","job":"job-name","buildid":"blabla","prowjobid":"pod","refs":{"org":"org-name","repo":"repo-name","base_ref":"base-ref","base_sha":"base-sha","pulls":[{"number":1,"author":"author-name","sha":"pull-sha"}]}}`},
 								{Name: "JOB_TYPE", Value: "presubmit"},
@@ -443,6 +509,7 @@ func TestProwJobToPod(t *testing.T) {
 								{Name: "REPO_NAME", Value: "repo-name"},
 								{Name: "REPO_OWNER", Value: "org-name"},
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 						},
 					},
 				},
@@ -513,6 +580,7 @@ func TestProwJobToPod(t *testing.T) {
 						kube.RepoLabel:         "repo-name",
 						kube.PullLabel:         "1",
 						kube.ProwJobAnnotation: "job-name",
+						kube.ProwBuildIDLabel:  "",
 					},
 					Annotations: map[string]string{
 						kube.ProwJobAnnotation: "job-name",
@@ -530,6 +598,7 @@ func TestProwJobToPod(t *testing.T) {
 							Env: []coreapi.EnvVar{
 								{Name: "CLONEREFS_OPTIONS", Value: `{"src_root":"/home/prow/go","log":"/logs/clone.json","git_user_name":"ci-robot","git_user_email":"ci-robot@k8s.io","refs":[{"org":"org-name","repo":"repo-name","base_ref":"base-ref","base_sha":"base-sha","pulls":[{"number":1,"author":"author-name","sha":"pull-sha"}],"path_alias":"somewhere/else"}],"cookie_path":"` + cookiePathOnly("yummy/.gitcookies") + `"}`},
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 							VolumeMounts: []coreapi.VolumeMount{
 								{
 									Name:      "logs",
@@ -538,6 +607,10 @@ func TestProwJobToPod(t *testing.T) {
 								{
 									Name:      "code",
 									MountPath: "/home/prow/go",
+								},
+								{
+									Name:      "clonerefs-tmp",
+									MountPath: "/tmp",
 								},
 								cookieMountOnly("yummy/.gitcookies"),
 							},
@@ -550,6 +623,7 @@ func TestProwJobToPod(t *testing.T) {
 								{Name: "INITUPLOAD_OPTIONS", Value: `{"bucket":"my-bucket","path_strategy":"legacy","default_org":"kubernetes","default_repo":"kubernetes","mediaTypes":{"log":"text/plain"},"gcs_credentials_file":"/secrets/gcs/service-account.json","dry_run":false,"log":"/logs/clone.json"}`},
 								{Name: "JOB_SPEC", Value: `{"type":"presubmit","job":"job-name","buildid":"blabla","prowjobid":"pod","refs":{"org":"org-name","repo":"repo-name","base_ref":"base-ref","base_sha":"base-sha","pulls":[{"number":1,"author":"author-name","sha":"pull-sha"}],"path_alias":"somewhere/else"}}`},
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 							VolumeMounts: []coreapi.VolumeMount{
 								{
 									Name:      "logs",
@@ -569,6 +643,7 @@ func TestProwJobToPod(t *testing.T) {
 								"/entrypoint",
 								"/tools/entrypoint",
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 							VolumeMounts: []coreapi.VolumeMount{
 								{
 									Name:      "tools",
@@ -589,6 +664,7 @@ func TestProwJobToPod(t *testing.T) {
 								{Name: "ARTIFACTS", Value: "/logs/artifacts"},
 								{Name: "BUILD_ID", Value: "blabla"},
 								{Name: "BUILD_NUMBER", Value: "blabla"},
+								{Name: "CI", Value: "true"},
 								{Name: "GOPATH", Value: "/home/prow/go"},
 								{Name: "JOB_NAME", Value: "job-name"},
 								{Name: "JOB_SPEC", Value: `{"type":"presubmit","job":"job-name","buildid":"blabla","prowjobid":"pod","refs":{"org":"org-name","repo":"repo-name","base_ref":"base-ref","base_sha":"base-sha","pulls":[{"number":1,"author":"author-name","sha":"pull-sha"}],"path_alias":"somewhere/else"}}`},
@@ -603,6 +679,7 @@ func TestProwJobToPod(t *testing.T) {
 								{Name: "REPO_OWNER", Value: "org-name"},
 								{Name: "ENTRYPOINT_OPTIONS", Value: `{"timeout":7200000000000,"grace_period":10000000000,"artifact_dir":"/logs/artifacts","args":["/bin/thing","some","args"],"process_log":"/logs/process-log.txt","marker_file":"/logs/marker-file.txt","metadata_file":"/logs/artifacts/metadata.json"}`},
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 							VolumeMounts: []coreapi.VolumeMount{
 								{
 									Name:      "logs",
@@ -626,6 +703,7 @@ func TestProwJobToPod(t *testing.T) {
 								{Name: "JOB_SPEC", Value: `{"type":"presubmit","job":"job-name","buildid":"blabla","prowjobid":"pod","refs":{"org":"org-name","repo":"repo-name","base_ref":"base-ref","base_sha":"base-sha","pulls":[{"number":1,"author":"author-name","sha":"pull-sha"}],"path_alias":"somewhere/else"}}`},
 								{Name: "SIDECAR_OPTIONS", Value: `{"gcs_options":{"items":["/logs/artifacts"],"bucket":"my-bucket","path_strategy":"legacy","default_org":"kubernetes","default_repo":"kubernetes","mediaTypes":{"log":"text/plain"},"gcs_credentials_file":"/secrets/gcs/service-account.json","dry_run":false},"entries":[{"args":["/bin/thing","some","args"],"process_log":"/logs/process-log.txt","marker_file":"/logs/marker-file.txt","metadata_file":"/logs/artifacts/metadata.json"}]}`},
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 							VolumeMounts: []coreapi.VolumeMount{
 								{
 									Name:      "logs",
@@ -638,6 +716,7 @@ func TestProwJobToPod(t *testing.T) {
 							},
 						},
 					},
+					TerminationGracePeriodSeconds: utilpointer.Int64Ptr(10),
 					Volumes: []coreapi.Volume{
 						{
 							Name: "logs",
@@ -657,6 +736,12 @@ func TestProwJobToPod(t *testing.T) {
 								Secret: &coreapi.SecretVolumeSource{
 									SecretName: "secret-name",
 								},
+							},
+						},
+						{
+							Name: "clonerefs-tmp",
+							VolumeSource: coreapi.VolumeSource{
+								EmptyDir: &coreapi.EmptyDirVolumeSource{},
 							},
 						},
 						cookieVolumeOnly("yummy/.gitcookies"),
@@ -734,6 +819,7 @@ func TestProwJobToPod(t *testing.T) {
 						kube.RepoLabel:         "repo-name",
 						kube.PullLabel:         "1",
 						kube.ProwJobAnnotation: "job-name",
+						kube.ProwBuildIDLabel:  "",
 					},
 					Annotations: map[string]string{
 						kube.ProwJobAnnotation: "job-name",
@@ -751,6 +837,7 @@ func TestProwJobToPod(t *testing.T) {
 							Env: []coreapi.EnvVar{
 								{Name: "CLONEREFS_OPTIONS", Value: `{"src_root":"/home/prow/go","log":"/logs/clone.json","git_user_name":"ci-robot","git_user_email":"ci-robot@k8s.io","refs":[{"org":"org-name","repo":"repo-name","base_ref":"base-ref","base_sha":"base-sha","pulls":[{"number":1,"author":"author-name","sha":"pull-sha"}],"path_alias":"somewhere/else"}],"cookie_path":"` + cookiePathOnly("yummy") + `"}`},
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 							VolumeMounts: []coreapi.VolumeMount{
 								{
 									Name:      "logs",
@@ -759,6 +846,10 @@ func TestProwJobToPod(t *testing.T) {
 								{
 									Name:      "code",
 									MountPath: "/home/prow/go",
+								},
+								{
+									Name:      "clonerefs-tmp",
+									MountPath: "/tmp",
 								},
 								cookieMountOnly("yummy"),
 							},
@@ -771,6 +862,7 @@ func TestProwJobToPod(t *testing.T) {
 								{Name: "INITUPLOAD_OPTIONS", Value: `{"bucket":"my-bucket","path_strategy":"legacy","default_org":"kubernetes","default_repo":"kubernetes","gcs_credentials_file":"/secrets/gcs/service-account.json","dry_run":false,"log":"/logs/clone.json"}`},
 								{Name: "JOB_SPEC", Value: `{"type":"presubmit","job":"job-name","buildid":"blabla","prowjobid":"pod","refs":{"org":"org-name","repo":"repo-name","base_ref":"base-ref","base_sha":"base-sha","pulls":[{"number":1,"author":"author-name","sha":"pull-sha"}],"path_alias":"somewhere/else"}}`},
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 							VolumeMounts: []coreapi.VolumeMount{
 								{
 									Name:      "logs",
@@ -790,6 +882,7 @@ func TestProwJobToPod(t *testing.T) {
 								"/entrypoint",
 								"/tools/entrypoint",
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 							VolumeMounts: []coreapi.VolumeMount{
 								{
 									Name:      "tools",
@@ -810,6 +903,7 @@ func TestProwJobToPod(t *testing.T) {
 								{Name: "ARTIFACTS", Value: "/logs/artifacts"},
 								{Name: "BUILD_ID", Value: "blabla"},
 								{Name: "BUILD_NUMBER", Value: "blabla"},
+								{Name: "CI", Value: "true"},
 								{Name: "GOPATH", Value: "/home/prow/go"},
 								{Name: "JOB_NAME", Value: "job-name"},
 								{Name: "JOB_SPEC", Value: `{"type":"presubmit","job":"job-name","buildid":"blabla","prowjobid":"pod","refs":{"org":"org-name","repo":"repo-name","base_ref":"base-ref","base_sha":"base-sha","pulls":[{"number":1,"author":"author-name","sha":"pull-sha"}],"path_alias":"somewhere/else"}}`},
@@ -824,6 +918,7 @@ func TestProwJobToPod(t *testing.T) {
 								{Name: "REPO_OWNER", Value: "org-name"},
 								{Name: "ENTRYPOINT_OPTIONS", Value: `{"timeout":7200000000000,"grace_period":10000000000,"artifact_dir":"/logs/artifacts","args":["/bin/thing","some","args"],"process_log":"/logs/process-log.txt","marker_file":"/logs/marker-file.txt","metadata_file":"/logs/artifacts/metadata.json"}`},
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 							VolumeMounts: []coreapi.VolumeMount{
 								{
 									Name:      "logs",
@@ -847,6 +942,7 @@ func TestProwJobToPod(t *testing.T) {
 								{Name: "JOB_SPEC", Value: `{"type":"presubmit","job":"job-name","buildid":"blabla","prowjobid":"pod","refs":{"org":"org-name","repo":"repo-name","base_ref":"base-ref","base_sha":"base-sha","pulls":[{"number":1,"author":"author-name","sha":"pull-sha"}],"path_alias":"somewhere/else"}}`},
 								{Name: "SIDECAR_OPTIONS", Value: `{"gcs_options":{"items":["/logs/artifacts"],"bucket":"my-bucket","path_strategy":"legacy","default_org":"kubernetes","default_repo":"kubernetes","gcs_credentials_file":"/secrets/gcs/service-account.json","dry_run":false},"entries":[{"args":["/bin/thing","some","args"],"process_log":"/logs/process-log.txt","marker_file":"/logs/marker-file.txt","metadata_file":"/logs/artifacts/metadata.json"}]}`},
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 							VolumeMounts: []coreapi.VolumeMount{
 								{
 									Name:      "logs",
@@ -859,6 +955,7 @@ func TestProwJobToPod(t *testing.T) {
 							},
 						},
 					},
+					TerminationGracePeriodSeconds: utilpointer.Int64Ptr(10),
 					Volumes: []coreapi.Volume{
 						{
 							Name: "logs",
@@ -878,6 +975,12 @@ func TestProwJobToPod(t *testing.T) {
 								Secret: &coreapi.SecretVolumeSource{
 									SecretName: "secret-name",
 								},
+							},
+						},
+						{
+							Name: "clonerefs-tmp",
+							VolumeSource: coreapi.VolumeSource{
+								EmptyDir: &coreapi.EmptyDirVolumeSource{},
 							},
 						},
 						cookieVolumeOnly("yummy"),
@@ -940,6 +1043,7 @@ func TestProwJobToPod(t *testing.T) {
 							Env: []coreapi.EnvVar{
 								{Name: "MY_ENV", Value: "rocks"},
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageReadFile,
 						},
 					},
 				},
@@ -956,6 +1060,7 @@ func TestProwJobToPod(t *testing.T) {
 						kube.RepoLabel:         "repo-name",
 						kube.PullLabel:         "1",
 						kube.ProwJobAnnotation: "job-name",
+						kube.ProwBuildIDLabel:  "",
 					},
 					Annotations: map[string]string{
 						kube.ProwJobAnnotation: "job-name",
@@ -972,6 +1077,7 @@ func TestProwJobToPod(t *testing.T) {
 							Env: []coreapi.EnvVar{
 								{Name: "CLONEREFS_OPTIONS", Value: `{"src_root":"/home/prow/go","log":"/logs/clone.json","git_user_name":"ci-robot","git_user_email":"ci-robot@k8s.io","refs":[{"org":"org-name","repo":"repo-name","base_ref":"base-ref","base_sha":"base-sha","pulls":[{"number":1,"author":"author-name","sha":"pull-sha"}],"path_alias":"somewhere/else"}],"key_files":["/secrets/ssh/ssh-1","/secrets/ssh/ssh-2"],"host_fingerprints":["hello","world"]}`},
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 							VolumeMounts: []coreapi.VolumeMount{
 								{
 									Name:      "logs",
@@ -991,6 +1097,10 @@ func TestProwJobToPod(t *testing.T) {
 									MountPath: "/secrets/ssh/ssh-2",
 									ReadOnly:  true,
 								},
+								{
+									Name:      "clonerefs-tmp",
+									MountPath: "/tmp",
+								},
 							},
 						},
 						{
@@ -1001,6 +1111,7 @@ func TestProwJobToPod(t *testing.T) {
 								{Name: "INITUPLOAD_OPTIONS", Value: `{"bucket":"my-bucket","path_strategy":"legacy","default_org":"kubernetes","default_repo":"kubernetes","gcs_credentials_file":"/secrets/gcs/service-account.json","dry_run":false,"log":"/logs/clone.json"}`},
 								{Name: "JOB_SPEC", Value: `{"type":"presubmit","job":"job-name","buildid":"blabla","prowjobid":"pod","refs":{"org":"org-name","repo":"repo-name","base_ref":"base-ref","base_sha":"base-sha","pulls":[{"number":1,"author":"author-name","sha":"pull-sha"}],"path_alias":"somewhere/else"}}`},
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 							VolumeMounts: []coreapi.VolumeMount{
 								{
 									Name:      "logs",
@@ -1020,6 +1131,7 @@ func TestProwJobToPod(t *testing.T) {
 								"/entrypoint",
 								"/tools/entrypoint",
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 							VolumeMounts: []coreapi.VolumeMount{
 								{
 									Name:      "tools",
@@ -1040,6 +1152,7 @@ func TestProwJobToPod(t *testing.T) {
 								{Name: "ARTIFACTS", Value: "/logs/artifacts"},
 								{Name: "BUILD_ID", Value: "blabla"},
 								{Name: "BUILD_NUMBER", Value: "blabla"},
+								{Name: "CI", Value: "true"},
 								{Name: "GOPATH", Value: "/home/prow/go"},
 								{Name: "JOB_NAME", Value: "job-name"},
 								{Name: "JOB_SPEC", Value: `{"type":"presubmit","job":"job-name","buildid":"blabla","prowjobid":"pod","refs":{"org":"org-name","repo":"repo-name","base_ref":"base-ref","base_sha":"base-sha","pulls":[{"number":1,"author":"author-name","sha":"pull-sha"}],"path_alias":"somewhere/else"}}`},
@@ -1054,6 +1167,7 @@ func TestProwJobToPod(t *testing.T) {
 								{Name: "REPO_OWNER", Value: "org-name"},
 								{Name: "ENTRYPOINT_OPTIONS", Value: `{"timeout":7200000000000,"grace_period":10000000000,"artifact_dir":"/logs/artifacts","args":["/bin/thing","some","args"],"process_log":"/logs/process-log.txt","marker_file":"/logs/marker-file.txt","metadata_file":"/logs/artifacts/metadata.json"}`},
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageReadFile,
 							VolumeMounts: []coreapi.VolumeMount{
 								{
 									Name:      "logs",
@@ -1077,6 +1191,7 @@ func TestProwJobToPod(t *testing.T) {
 								{Name: "JOB_SPEC", Value: `{"type":"presubmit","job":"job-name","buildid":"blabla","prowjobid":"pod","refs":{"org":"org-name","repo":"repo-name","base_ref":"base-ref","base_sha":"base-sha","pulls":[{"number":1,"author":"author-name","sha":"pull-sha"}],"path_alias":"somewhere/else"}}`},
 								{Name: "SIDECAR_OPTIONS", Value: `{"gcs_options":{"items":["/logs/artifacts"],"bucket":"my-bucket","path_strategy":"legacy","default_org":"kubernetes","default_repo":"kubernetes","gcs_credentials_file":"/secrets/gcs/service-account.json","dry_run":false},"entries":[{"args":["/bin/thing","some","args"],"process_log":"/logs/process-log.txt","marker_file":"/logs/marker-file.txt","metadata_file":"/logs/artifacts/metadata.json"}]}`},
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 							VolumeMounts: []coreapi.VolumeMount{
 								{
 									Name:      "logs",
@@ -1089,6 +1204,7 @@ func TestProwJobToPod(t *testing.T) {
 							},
 						},
 					},
+					TerminationGracePeriodSeconds: utilpointer.Int64Ptr(10),
 					Volumes: []coreapi.Volume{
 						{
 							Name: "logs",
@@ -1126,6 +1242,12 @@ func TestProwJobToPod(t *testing.T) {
 									SecretName:  "ssh-2",
 									DefaultMode: &sshKeyMode,
 								},
+							},
+						},
+						{
+							Name: "clonerefs-tmp",
+							VolumeSource: coreapi.VolumeSource{
+								EmptyDir: &coreapi.EmptyDirVolumeSource{},
 							},
 						},
 						{
@@ -1202,6 +1324,7 @@ func TestProwJobToPod(t *testing.T) {
 						kube.RepoLabel:         "repo-name",
 						kube.PullLabel:         "1",
 						kube.ProwJobAnnotation: "job-name",
+						kube.ProwBuildIDLabel:  "",
 					},
 					Annotations: map[string]string{
 						kube.ProwJobAnnotation: "job-name",
@@ -1218,6 +1341,7 @@ func TestProwJobToPod(t *testing.T) {
 							Env: []coreapi.EnvVar{
 								{Name: "CLONEREFS_OPTIONS", Value: `{"src_root":"/home/prow/go","log":"/logs/clone.json","git_user_name":"ci-robot","git_user_email":"ci-robot@k8s.io","refs":[{"org":"org-name","repo":"repo-name","base_ref":"base-ref","base_sha":"base-sha","pulls":[{"number":1,"author":"author-name","sha":"pull-sha"}],"path_alias":"somewhere/else"}],"key_files":["/secrets/ssh/ssh-1","/secrets/ssh/ssh-2"]}`},
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 							VolumeMounts: []coreapi.VolumeMount{
 								{
 									Name:      "logs",
@@ -1237,6 +1361,10 @@ func TestProwJobToPod(t *testing.T) {
 									MountPath: "/secrets/ssh/ssh-2",
 									ReadOnly:  true,
 								},
+								{
+									Name:      "clonerefs-tmp",
+									MountPath: "/tmp",
+								},
 							},
 						},
 						{
@@ -1247,6 +1375,7 @@ func TestProwJobToPod(t *testing.T) {
 								{Name: "INITUPLOAD_OPTIONS", Value: `{"bucket":"my-bucket","path_strategy":"legacy","default_org":"kubernetes","default_repo":"kubernetes","gcs_credentials_file":"/secrets/gcs/service-account.json","dry_run":false,"log":"/logs/clone.json"}`},
 								{Name: "JOB_SPEC", Value: `{"type":"presubmit","job":"job-name","buildid":"blabla","prowjobid":"pod","refs":{"org":"org-name","repo":"repo-name","base_ref":"base-ref","base_sha":"base-sha","pulls":[{"number":1,"author":"author-name","sha":"pull-sha"}],"path_alias":"somewhere/else"}}`},
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 							VolumeMounts: []coreapi.VolumeMount{
 								{
 									Name:      "logs",
@@ -1266,6 +1395,7 @@ func TestProwJobToPod(t *testing.T) {
 								"/entrypoint",
 								"/tools/entrypoint",
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 							VolumeMounts: []coreapi.VolumeMount{
 								{
 									Name:      "tools",
@@ -1286,6 +1416,7 @@ func TestProwJobToPod(t *testing.T) {
 								{Name: "ARTIFACTS", Value: "/logs/artifacts"},
 								{Name: "BUILD_ID", Value: "blabla"},
 								{Name: "BUILD_NUMBER", Value: "blabla"},
+								{Name: "CI", Value: "true"},
 								{Name: "GOPATH", Value: "/home/prow/go"},
 								{Name: "JOB_NAME", Value: "job-name"},
 								{Name: "JOB_SPEC", Value: `{"type":"presubmit","job":"job-name","buildid":"blabla","prowjobid":"pod","refs":{"org":"org-name","repo":"repo-name","base_ref":"base-ref","base_sha":"base-sha","pulls":[{"number":1,"author":"author-name","sha":"pull-sha"}],"path_alias":"somewhere/else"}}`},
@@ -1300,6 +1431,7 @@ func TestProwJobToPod(t *testing.T) {
 								{Name: "REPO_OWNER", Value: "org-name"},
 								{Name: "ENTRYPOINT_OPTIONS", Value: `{"timeout":7200000000000,"grace_period":10000000000,"artifact_dir":"/logs/artifacts","args":["/bin/thing","some","args"],"process_log":"/logs/process-log.txt","marker_file":"/logs/marker-file.txt","metadata_file":"/logs/artifacts/metadata.json"}`},
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 							VolumeMounts: []coreapi.VolumeMount{
 								{
 									Name:      "logs",
@@ -1323,6 +1455,7 @@ func TestProwJobToPod(t *testing.T) {
 								{Name: "JOB_SPEC", Value: `{"type":"presubmit","job":"job-name","buildid":"blabla","prowjobid":"pod","refs":{"org":"org-name","repo":"repo-name","base_ref":"base-ref","base_sha":"base-sha","pulls":[{"number":1,"author":"author-name","sha":"pull-sha"}],"path_alias":"somewhere/else"}}`},
 								{Name: "SIDECAR_OPTIONS", Value: `{"gcs_options":{"items":["/logs/artifacts"],"bucket":"my-bucket","path_strategy":"legacy","default_org":"kubernetes","default_repo":"kubernetes","gcs_credentials_file":"/secrets/gcs/service-account.json","dry_run":false},"entries":[{"args":["/bin/thing","some","args"],"process_log":"/logs/process-log.txt","marker_file":"/logs/marker-file.txt","metadata_file":"/logs/artifacts/metadata.json"}]}`},
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 							VolumeMounts: []coreapi.VolumeMount{
 								{
 									Name:      "logs",
@@ -1335,6 +1468,7 @@ func TestProwJobToPod(t *testing.T) {
 							},
 						},
 					},
+					TerminationGracePeriodSeconds: utilpointer.Int64Ptr(10),
 					Volumes: []coreapi.Volume{
 						{
 							Name: "logs",
@@ -1372,6 +1506,12 @@ func TestProwJobToPod(t *testing.T) {
 									SecretName:  "ssh-2",
 									DefaultMode: &sshKeyMode,
 								},
+							},
+						},
+						{
+							Name: "clonerefs-tmp",
+							VolumeSource: coreapi.VolumeSource{
+								EmptyDir: &coreapi.EmptyDirVolumeSource{},
 							},
 						},
 						{
@@ -1432,6 +1572,7 @@ func TestProwJobToPod(t *testing.T) {
 						kube.ProwJobIDLabel:    "pod",
 						"needstobe":            "inherited",
 						kube.ProwJobAnnotation: "job-name",
+						kube.ProwBuildIDLabel:  "",
 					},
 					Annotations: map[string]string{
 						kube.ProwJobAnnotation: "job-name",
@@ -1449,6 +1590,7 @@ func TestProwJobToPod(t *testing.T) {
 								{Name: "INITUPLOAD_OPTIONS", Value: `{"bucket":"my-bucket","path_strategy":"legacy","default_org":"kubernetes","default_repo":"kubernetes","gcs_credentials_file":"/secrets/gcs/service-account.json","dry_run":false}`},
 								{Name: "JOB_SPEC", Value: `{"type":"periodic","job":"job-name","buildid":"blabla","prowjobid":"pod"}`},
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 							VolumeMounts: []coreapi.VolumeMount{
 								// don't mount log since we're not uploading a clone log
 								{
@@ -1465,6 +1607,7 @@ func TestProwJobToPod(t *testing.T) {
 								"/entrypoint",
 								"/tools/entrypoint",
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 							VolumeMounts: []coreapi.VolumeMount{
 								{
 									Name:      "tools",
@@ -1484,6 +1627,7 @@ func TestProwJobToPod(t *testing.T) {
 								{Name: "ARTIFACTS", Value: "/logs/artifacts"},
 								{Name: "BUILD_ID", Value: "blabla"},
 								{Name: "BUILD_NUMBER", Value: "blabla"},
+								{Name: "CI", Value: "true"},
 								{Name: "GOPATH", Value: "/home/prow/go"},
 								{Name: "JOB_NAME", Value: "job-name"},
 								{Name: "JOB_SPEC", Value: `{"type":"periodic","job":"job-name","buildid":"blabla","prowjobid":"pod"}`},
@@ -1491,6 +1635,7 @@ func TestProwJobToPod(t *testing.T) {
 								{Name: "PROW_JOB_ID", Value: "pod"},
 								{Name: "ENTRYPOINT_OPTIONS", Value: `{"timeout":7200000000000,"grace_period":10000000000,"artifact_dir":"/logs/artifacts","args":["/bin/thing","some","args"],"process_log":"/logs/process-log.txt","marker_file":"/logs/marker-file.txt","metadata_file":"/logs/artifacts/metadata.json"}`},
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 							VolumeMounts: []coreapi.VolumeMount{
 								{
 									Name:      "logs",
@@ -1510,6 +1655,7 @@ func TestProwJobToPod(t *testing.T) {
 								{Name: "JOB_SPEC", Value: `{"type":"periodic","job":"job-name","buildid":"blabla","prowjobid":"pod"}`},
 								{Name: "SIDECAR_OPTIONS", Value: `{"gcs_options":{"items":["/logs/artifacts"],"bucket":"my-bucket","path_strategy":"legacy","default_org":"kubernetes","default_repo":"kubernetes","gcs_credentials_file":"/secrets/gcs/service-account.json","dry_run":false},"entries":[{"args":["/bin/thing","some","args"],"process_log":"/logs/process-log.txt","marker_file":"/logs/marker-file.txt","metadata_file":"/logs/artifacts/metadata.json"}]}`},
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 							VolumeMounts: []coreapi.VolumeMount{
 								{
 									Name:      "logs",
@@ -1522,6 +1668,7 @@ func TestProwJobToPod(t *testing.T) {
 							},
 						},
 					},
+					TerminationGracePeriodSeconds: utilpointer.Int64Ptr(10),
 					Volumes: []coreapi.Volume{
 						{
 							Name: "logs",
@@ -1617,6 +1764,7 @@ func TestProwJobToPod(t *testing.T) {
 						kube.RepoLabel:         "repo-name",
 						kube.PullLabel:         "1",
 						kube.ProwJobAnnotation: "job-name",
+						kube.ProwBuildIDLabel:  "",
 					},
 					Annotations: map[string]string{
 						kube.ProwJobAnnotation: "job-name",
@@ -1634,6 +1782,7 @@ func TestProwJobToPod(t *testing.T) {
 								{Name: "INITUPLOAD_OPTIONS", Value: `{"bucket":"my-bucket","path_strategy":"legacy","default_org":"kubernetes","default_repo":"kubernetes","gcs_credentials_file":"/secrets/gcs/service-account.json","dry_run":false}`},
 								{Name: "JOB_SPEC", Value: `{"type":"presubmit","job":"job-name","buildid":"blabla","prowjobid":"pod","refs":{"org":"org-name","repo":"repo-name","base_ref":"base-ref","base_sha":"base-sha","pulls":[{"number":1,"author":"author-name","sha":"pull-sha"}],"path_alias":"somewhere/else"},"extra_refs":[{"org":"extra-org","repo":"extra-repo"}]}`},
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 							VolumeMounts: []coreapi.VolumeMount{
 								// don't mount log since we're not uploading a clone log
 								{
@@ -1650,6 +1799,7 @@ func TestProwJobToPod(t *testing.T) {
 								"/entrypoint",
 								"/tools/entrypoint",
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 							VolumeMounts: []coreapi.VolumeMount{
 								{
 									Name:      "tools",
@@ -1669,6 +1819,7 @@ func TestProwJobToPod(t *testing.T) {
 								{Name: "ARTIFACTS", Value: "/logs/artifacts"},
 								{Name: "BUILD_ID", Value: "blabla"},
 								{Name: "BUILD_NUMBER", Value: "blabla"},
+								{Name: "CI", Value: "true"},
 								{Name: "GOPATH", Value: "/home/prow/go"},
 								{Name: "JOB_NAME", Value: "job-name"},
 								{Name: "JOB_SPEC", Value: `{"type":"presubmit","job":"job-name","buildid":"blabla","prowjobid":"pod","refs":{"org":"org-name","repo":"repo-name","base_ref":"base-ref","base_sha":"base-sha","pulls":[{"number":1,"author":"author-name","sha":"pull-sha"}],"path_alias":"somewhere/else"},"extra_refs":[{"org":"extra-org","repo":"extra-repo"}]}`},
@@ -1683,6 +1834,7 @@ func TestProwJobToPod(t *testing.T) {
 								{Name: "REPO_OWNER", Value: "org-name"},
 								{Name: "ENTRYPOINT_OPTIONS", Value: `{"timeout":7200000000000,"grace_period":10000000000,"artifact_dir":"/logs/artifacts","args":["/bin/thing","some","args"],"process_log":"/logs/process-log.txt","marker_file":"/logs/marker-file.txt","metadata_file":"/logs/artifacts/metadata.json"}`},
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 							VolumeMounts: []coreapi.VolumeMount{
 								{
 									Name:      "logs",
@@ -1702,6 +1854,7 @@ func TestProwJobToPod(t *testing.T) {
 								{Name: "JOB_SPEC", Value: `{"type":"presubmit","job":"job-name","buildid":"blabla","prowjobid":"pod","refs":{"org":"org-name","repo":"repo-name","base_ref":"base-ref","base_sha":"base-sha","pulls":[{"number":1,"author":"author-name","sha":"pull-sha"}],"path_alias":"somewhere/else"},"extra_refs":[{"org":"extra-org","repo":"extra-repo"}]}`},
 								{Name: "SIDECAR_OPTIONS", Value: `{"gcs_options":{"items":["/logs/artifacts"],"bucket":"my-bucket","path_strategy":"legacy","default_org":"kubernetes","default_repo":"kubernetes","gcs_credentials_file":"/secrets/gcs/service-account.json","dry_run":false},"entries":[{"args":["/bin/thing","some","args"],"process_log":"/logs/process-log.txt","marker_file":"/logs/marker-file.txt","metadata_file":"/logs/artifacts/metadata.json"}]}`},
 							},
+							TerminationMessagePolicy: coreapi.TerminationMessageFallbackToLogsOnError,
 							VolumeMounts: []coreapi.VolumeMount{
 								{
 									Name:      "logs",
@@ -1714,6 +1867,7 @@ func TestProwJobToPod(t *testing.T) {
 							},
 						},
 					},
+					TerminationGracePeriodSeconds: utilpointer.Int64Ptr(10),
 					Volumes: []coreapi.Volume{
 						{
 							Name: "logs",
@@ -1787,7 +1941,7 @@ func TestProwJobToPod(t *testing.T) {
 
 	for i, test := range tests {
 		t.Run(strconv.Itoa(i), func(t *testing.T) {
-			pj := prowapi.ProwJob{ObjectMeta: metav1.ObjectMeta{Name: test.podName, Labels: test.labels}, Spec: test.pjSpec}
+			pj := prowapi.ProwJob{ObjectMeta: metav1.ObjectMeta{Name: test.podName, Labels: test.labels}, Spec: test.pjSpec, Status: test.pjStatus}
 			got, err := ProwJobToPod(pj, test.buildID)
 			if err != nil {
 				t.Errorf("unexpected error: %v", err)
@@ -1809,6 +1963,54 @@ func TestProwJobToPod(t *testing.T) {
 				if err := checkEnv(*got, "test", entrypoint.NewOptions()); err != nil {
 					t.Errorf("bad test entrypoint: %v", err)
 				}
+			}
+		})
+	}
+}
+
+func TestProwJobToPod_setsTerminationGracePeriodSeconds(t *testing.T) {
+	testCases := []struct {
+		name                                  string
+		prowjob                               *prowapi.ProwJob
+		expectedTerminationGracePeriodSeconds int64
+	}{
+		{
+			name: "GracePeriodSeconds from decoration config",
+			prowjob: &prowapi.ProwJob{
+				Spec: prowapi.ProwJobSpec{
+					PodSpec: &coreapi.PodSpec{Containers: []coreapi.Container{{}}},
+					DecorationConfig: &prowapi.DecorationConfig{
+						UtilityImages: &prowapi.UtilityImages{},
+						GracePeriod:   &prowapi.Duration{Duration: 10 * time.Second},
+					},
+				},
+			},
+			expectedTerminationGracePeriodSeconds: 10,
+		},
+		{
+			name: "Existing GracePeriodSeconds is not overwritten",
+			prowjob: &prowapi.ProwJob{
+				Spec: prowapi.ProwJobSpec{
+					PodSpec: &coreapi.PodSpec{TerminationGracePeriodSeconds: utilpointer.Int64Ptr(60), Containers: []coreapi.Container{{}}},
+					DecorationConfig: &prowapi.DecorationConfig{
+						UtilityImages: &prowapi.UtilityImages{},
+						Timeout:       &prowapi.Duration{Duration: 10 * time.Second},
+					},
+				},
+			},
+			expectedTerminationGracePeriodSeconds: 60,
+		},
+	}
+
+	for idx := range testCases {
+		tc := testCases[idx]
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if err := decorate(tc.prowjob.Spec.PodSpec, tc.prowjob, map[string]string{}, ""); err != nil {
+				t.Fatalf("decoration failed: %v", err)
+			}
+			if tc.prowjob.Spec.PodSpec.TerminationGracePeriodSeconds == nil || *tc.prowjob.Spec.PodSpec.TerminationGracePeriodSeconds != tc.expectedTerminationGracePeriodSeconds {
+				t.Errorf("expected pods TerminationGracePeriodSeconds to be %d was %v", tc.expectedTerminationGracePeriodSeconds, tc.prowjob.Spec.PodSpec.TerminationGracePeriodSeconds)
 			}
 		})
 	}

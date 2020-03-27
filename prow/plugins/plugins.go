@@ -19,20 +19,23 @@ package plugins
 import (
 	"errors"
 	"fmt"
-	"github.com/prometheus/client_golang/prometheus"
 	"io/ioutil"
 	"sync"
 	"time"
 
+	"k8s.io/test-infra/pkg/genyaml"
+
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/test-infra/prow/bugzilla"
-	prowv1 "k8s.io/test-infra/prow/client/clientset/versioned/typed/prowjobs/v1"
+	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"sigs.k8s.io/yaml"
 
+	"k8s.io/test-infra/prow/bugzilla"
+	prowv1 "k8s.io/test-infra/prow/client/clientset/versioned/typed/prowjobs/v1"
 	"k8s.io/test-infra/prow/commentpruner"
 	"k8s.io/test-infra/prow/config"
-	"k8s.io/test-infra/prow/git"
+	"k8s.io/test-infra/prow/git/v2"
 	"k8s.io/test-infra/prow/github"
 	"k8s.io/test-infra/prow/pluginhelp"
 	"k8s.io/test-infra/prow/repoowners"
@@ -49,11 +52,12 @@ var (
 	reviewEventHandlers        = map[string]ReviewEventHandler{}
 	reviewCommentEventHandlers = map[string]ReviewCommentEventHandler{}
 	statusEventHandlers        = map[string]StatusEventHandler{}
+	CommentMap                 = genyaml.NewCommentMap("prow/plugins/config.go")
 )
 
 // HelpProvider defines the function type that construct a pluginhelp.PluginHelp for enabled
 // plugins. It takes into account the plugins configuration and enabled repositories.
-type HelpProvider func(config *Configuration, enabledRepos []string) (*pluginhelp.PluginHelp, error)
+type HelpProvider func(config *Configuration, enabledRepos []config.OrgRepo) (*pluginhelp.PluginHelp, error)
 
 // HelpProviders returns the map of registered plugins with their associated HelpProvider.
 func HelpProviders() map[string]HelpProvider {
@@ -134,14 +138,15 @@ func RegisterGenericCommentHandler(name string, fn GenericCommentHandler, help H
 
 // Agent may be used concurrently, so each entry must be thread-safe.
 type Agent struct {
-	GitHubClient     github.Client
-	ProwJobClient    prowv1.ProwJobInterface
-	KubernetesClient kubernetes.Interface
-	GitClient        *git.Client
-	SlackClient      *slack.Client
-	BugzillaClient   bugzilla.Client
+	GitHubClient              github.Client
+	ProwJobClient             prowv1.ProwJobInterface
+	KubernetesClient          kubernetes.Interface
+	BuildClusterCoreV1Clients map[string]corev1.CoreV1Interface
+	GitClient                 git.ClientFactory
+	SlackClient               *slack.Client
+	BugzillaClient            bugzilla.Client
 
-	OwnersClient *repoowners.Client
+	OwnersClient repoowners.Interface
 
 	// Metrics exposes metrics that can be updated by plugins
 	Metrics *Metrics
@@ -159,21 +164,23 @@ type Agent struct {
 }
 
 // NewAgent bootstraps a new config.Agent struct from the passed dependencies.
-func NewAgent(configAgent *config.Agent, pluginConfigAgent *ConfigAgent, clientAgent *ClientAgent, metrics *Metrics, logger *logrus.Entry) Agent {
+func NewAgent(configAgent *config.Agent, pluginConfigAgent *ConfigAgent, clientAgent *ClientAgent, metrics *Metrics, logger *logrus.Entry, plugin string) Agent {
 	prowConfig := configAgent.Config()
 	pluginConfig := pluginConfigAgent.Config()
+	gitHubClient := clientAgent.GitHubClient.WithFields(logger.Data).ForPlugin(plugin)
 	return Agent{
-		GitHubClient:     clientAgent.GitHubClient.WithFields(logger.Data),
-		KubernetesClient: clientAgent.KubernetesClient,
-		ProwJobClient:    clientAgent.ProwJobClient,
-		GitClient:        clientAgent.GitClient,
-		SlackClient:      clientAgent.SlackClient,
-		OwnersClient:     clientAgent.OwnersClient,
-		BugzillaClient:   clientAgent.BugzillaClient,
-		Metrics:          metrics,
-		Config:           prowConfig,
-		PluginConfig:     pluginConfig,
-		Logger:           logger,
+		GitHubClient:              gitHubClient,
+		KubernetesClient:          clientAgent.KubernetesClient,
+		BuildClusterCoreV1Clients: clientAgent.BuildClusterCoreV1Clients,
+		ProwJobClient:             clientAgent.ProwJobClient,
+		GitClient:                 clientAgent.GitClient,
+		SlackClient:               clientAgent.SlackClient,
+		OwnersClient:              clientAgent.OwnersClient.WithFields(logger.Data).WithGitHubClient(gitHubClient),
+		BugzillaClient:            clientAgent.BugzillaClient,
+		Metrics:                   metrics,
+		Config:                    prowConfig,
+		PluginConfig:              pluginConfig,
+		Logger:                    logger,
 	}
 }
 
@@ -197,13 +204,14 @@ func (a *Agent) CommentPruner() (*commentpruner.EventClient, error) {
 
 // ClientAgent contains the various clients that are attached to the Agent.
 type ClientAgent struct {
-	GitHubClient     github.Client
-	ProwJobClient    prowv1.ProwJobInterface
-	KubernetesClient kubernetes.Interface
-	GitClient        *git.Client
-	SlackClient      *slack.Client
-	OwnersClient     *repoowners.Client
-	BugzillaClient   bugzilla.Client
+	GitHubClient              github.Client
+	ProwJobClient             prowv1.ProwJobInterface
+	KubernetesClient          kubernetes.Interface
+	BuildClusterCoreV1Clients map[string]corev1.CoreV1Interface
+	GitClient                 git.ClientFactory
+	SlackClient               *slack.Client
+	OwnersClient              repoowners.Interface
+	BugzillaClient            bugzilla.Client
 }
 
 // ConfigAgent contains the agent mutex and the Agent configuration.
@@ -212,9 +220,15 @@ type ConfigAgent struct {
 	configuration *Configuration
 }
 
+func NewFakeConfigAgent() ConfigAgent {
+	return ConfigAgent{configuration: &Configuration{}}
+}
+
 // Load attempts to load config from the path. It returns an error if either
 // the file can't be read or the configuration is invalid.
-func (pa *ConfigAgent) Load(path string) error {
+// If checkUnknownPlugins is true, unrecognized plugin names will make config
+// loading fail.
+func (pa *ConfigAgent) Load(path string, checkUnknownPlugins bool) error {
 	b, err := ioutil.ReadFile(path)
 	if err != nil {
 		return err
@@ -225,6 +239,11 @@ func (pa *ConfigAgent) Load(path string) error {
 	}
 	if err := np.Validate(); err != nil {
 		return err
+	}
+	if checkUnknownPlugins {
+		if err := np.ValidatePluginsUnknown(); err != nil {
+			return err
+		}
 	}
 
 	pa.Set(np)
@@ -250,14 +269,16 @@ func (pa *ConfigAgent) Set(pc *Configuration) {
 
 // Start starts polling path for plugin config. If the first attempt fails,
 // then start returns the error. Future errors will halt updates but not stop.
-func (pa *ConfigAgent) Start(path string) error {
-	if err := pa.Load(path); err != nil {
+// If checkUnknownPlugins is true, unrecognized plugin names will make config
+// loading fail.
+func (pa *ConfigAgent) Start(path string, checkUnknownPlugins bool) error {
+	if err := pa.Load(path, checkUnknownPlugins); err != nil {
 		return err
 	}
 	ticker := time.Tick(1 * time.Minute)
 	go func() {
 		for range ticker {
-			if err := pa.Load(path); err != nil {
+			if err := pa.Load(path, checkUnknownPlugins); err != nil {
 				logrus.WithField("path", path).WithError(err).Error("Error loading plugin config.")
 			}
 		}

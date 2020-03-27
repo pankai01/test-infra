@@ -20,21 +20,20 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/test-infra/prow/pjutil"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"k8s.io/test-infra/pkg/flagutil"
 	"k8s.io/test-infra/prow/config"
 	"k8s.io/test-infra/prow/config/secret"
 	prowflagutil "k8s.io/test-infra/prow/flagutil"
-	"k8s.io/test-infra/prow/kube"
+	"k8s.io/test-infra/prow/interrupts"
 	"k8s.io/test-infra/prow/logrusutil"
 	"k8s.io/test-infra/prow/metrics"
+	"k8s.io/test-infra/prow/pjutil"
 	"k8s.io/test-infra/prow/plank"
 )
 
@@ -58,8 +57,7 @@ func gatherOptions(fs *flag.FlagSet, args ...string) options {
 
 	fs.StringVar(&o.configPath, "config-path", "", "Path to config.yaml.")
 	fs.StringVar(&o.jobConfigPath, "job-config-path", "", "Path to prow job configs.")
-	fs.StringVar(&o.buildCluster, "build-cluster", "", "Path to file containing a YAML-marshalled kube.Cluster object. If empty, uses the local cluster.")
-	fs.StringVar(&o.selector, "label-selector", kube.EmptySelector, "Label selector to be applied in prowjobs. See https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#label-selectors for constructing a label selector.")
+	fs.StringVar(&o.selector, "label-selector", labels.Everything().String(), "Label selector to be applied in prowjobs. See https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#label-selectors for constructing a label selector.")
 	fs.BoolVar(&o.skipReport, "skip-report", false, "Whether or not to ignore report with githubClient")
 
 	fs.BoolVar(&o.dryRun, "dry-run", true, "Whether or not to make mutating API calls to GitHub.")
@@ -87,12 +85,14 @@ func (o *options) Validate() error {
 }
 
 func main() {
-	logrusutil.ComponentInit("plank")
+	logrusutil.ComponentInit()
 
 	o := gatherOptions(flag.NewFlagSet(os.Args[0], flag.ExitOnError), os.Args[1:]...)
 	if err := o.Validate(); err != nil {
 		logrus.WithError(err).Fatal("Invalid options")
 	}
+
+	defer interrupts.WaitForGracefulShutdown()
 
 	pjutil.ServePProf()
 
@@ -114,30 +114,25 @@ func main() {
 		logrus.WithError(err).Fatal("Error getting GitHub client.")
 	}
 
-	kubeClient, err := o.kubernetes.Client(cfg().ProwJobNamespace, o.dryRun)
+	infrastructureClusterConfig, err := o.kubernetes.InfrastructureClusterConfig(o.dryRun)
 	if err != nil {
-		logrus.WithError(err).Fatal("Error getting kube client.")
+		logrus.WithError(err).Fatal("Error getting infrastructure cluster config.")
+	}
+	opts := manager.Options{
+		MetricsBindAddress: "0",
+		Namespace:          cfg().ProwJobNamespace,
+	}
+	mgr, err := manager.New(infrastructureClusterConfig, opts)
+	if err != nil {
+		logrus.WithError(err).Fatal("Error creating manager")
 	}
 
-	var pkcs map[string]*kube.Client
-	if o.dryRun {
-		pkcs = map[string]*kube.Client{kube.DefaultClusterAlias: kubeClient}
-	} else {
-		if o.buildCluster == "" {
-			pkc, err := kube.NewClientInCluster(cfg().PodNamespace)
-			if err != nil {
-				logrus.WithError(err).Fatal("Error getting kube client.")
-			}
-			pkcs = map[string]*kube.Client{kube.DefaultClusterAlias: pkc}
-		} else {
-			pkcs, err = kube.ClientMapFromFile(o.buildCluster, cfg().PodNamespace)
-			if err != nil {
-				logrus.WithError(err).Fatal("Error getting kube client to build cluster.")
-			}
-		}
+	buildClusterClients, err := o.kubernetes.BuildClusterUncachedRuntimeClients(o.dryRun)
+	if err != nil {
+		logrus.WithError(err).Fatal("Error creating build cluster clients.")
 	}
 
-	c, err := plank.NewController(kubeClient, pkcs, githubClient, nil, cfg, o.totURL, o.selector, o.skipReport)
+	c, err := plank.NewController(mgr.GetClient(), buildClusterClients, githubClient, nil, cfg, o.totURL, o.selector, o.skipReport)
 	if err != nil {
 		logrus.WithError(err).Fatal("Error creating plank controller.")
 	}
@@ -145,43 +140,17 @@ func main() {
 	// Expose prometheus metrics
 	metrics.ExposeMetrics("plank", cfg().PushGateway)
 	// gather metrics for the jobs handled by plank.
-	go gather(c)
+	interrupts.TickLiteral(func() {
+		start := time.Now()
+		c.SyncMetrics()
+		logrus.WithField("metrics-duration", fmt.Sprintf("%v", time.Since(start))).Debug("Metrics synced")
+	}, 30*time.Second)
 
-	tick := time.Tick(30 * time.Second)
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-
-	for {
-		select {
-		case <-tick:
-			start := time.Now()
-			if err := c.Sync(); err != nil {
-				logrus.WithError(err).Error("Error syncing.")
-			}
-			logrus.WithField("duration", fmt.Sprintf("%v", time.Since(start))).Info("Synced")
-		case <-sig:
-			logrus.Info("Plank is shutting down...")
-			return
-		}
+	// run the controller
+	if err := mgr.Add(c); err != nil {
+		logrus.WithError(err).Fatal("failed to add controller to manager")
 	}
-}
-
-// gather metrics from plank.
-// Meant to be called inside a goroutine.
-func gather(c *plank.Controller) {
-	tick := time.Tick(30 * time.Second)
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-
-	for {
-		select {
-		case <-tick:
-			start := time.Now()
-			c.SyncMetrics()
-			logrus.WithField("metrics-duration", fmt.Sprintf("%v", time.Since(start))).Debug("Metrics synced")
-		case <-sig:
-			logrus.Debug("Plank gatherer is shutting down...")
-			return
-		}
+	if err := mgr.Start(interrupts.Context().Done()); err != nil {
+		logrus.WithError(err).Fatal("failed to start manager")
 	}
 }

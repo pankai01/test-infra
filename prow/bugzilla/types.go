@@ -22,7 +22,7 @@ type Bug struct {
 	// ActualTime is the total number of hours that this bug has taken so far. If you are not in the time-tracking group, this field will not be included in the return value.
 	ActualTime int `json:"actual_time,omitempty"`
 	// Alias is the unique aliases of this bug. An empty array will be returned if this bug has no aliases.
-	Alias []int `json:"alias,omitempty"`
+	Alias []string `json:"alias,omitempty"`
 	// AssignedTo is the login name of the user to whom the bug is assigned.
 	AssignedTo string `json:"assigned_to,omitempty"`
 	// AssignedToDetail is an object containing detailed user information for the assigned_to. To see the keys included in the user detail object, see below.
@@ -143,7 +143,8 @@ type Flag struct {
 // https://bugzilla.readthedocs.io/en/latest/api/core/v1/bug.html#update-bug
 type BugUpdate struct {
 	// Status is the current status of the bug.
-	Status string `json:"status,omitempty"`
+	Status     string `json:"status,omitempty"`
+	Resolution string `json:"resolution,omitempty"`
 }
 
 // ExternalBug contains details about an external bug linked to a Bugzilla bug.

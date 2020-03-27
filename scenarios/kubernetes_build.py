@@ -126,6 +126,12 @@ def main(args):
         push_build_args.append('--extra-publish-file=%s' % args.extra_publish_file)
     if args.allow_dup:
         push_build_args.append('--allow-dup')
+    if args.skip_update_latest:
+        push_build_args.append('--noupdatelatest')
+    if args.register_gcloud_helper:
+        # Configure docker client for gcr.io authentication to allow communication
+        # with non-public registries.
+        check_no_stdout('gcloud', 'auth', 'configure-docker')
 
     for key, value in env.items():
         os.environ[key] = value
@@ -160,6 +166,11 @@ if __name__ == '__main__':
     PARSER.add_argument(
         '--allow-dup', action='store_true', help='Allow overwriting if the build exists on gcs')
     PARSER.add_argument(
+        '--skip-update-latest', action='store_true', help='Do not update the latest file')
+    PARSER.add_argument(
         '--push-build-script', default='../release/push-build.sh', help='location of push-build.sh')
+    PARSER.add_argument(
+        '--register-gcloud-helper', action='store_true',
+        help='Register gcloud as docker credentials helper')
     ARGS = PARSER.parse_args()
     main(ARGS)

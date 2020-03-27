@@ -31,6 +31,9 @@ func makeRequest(policy branchprotection.Policy) github.BranchProtectionRequest 
 		RequiredPullRequestReviews: makeReviews(policy.RequiredPullRequestReviews),
 		RequiredStatusChecks:       makeChecks(policy.RequiredStatusChecks),
 		Restrictions:               makeRestrictions(policy.Restrictions),
+		RequiredLinearHistory:      makeBool(policy.RequiredLinearHistory),
+		AllowForcePushes:           makeBool(policy.AllowForcePushes),
+		AllowDeletions:             makeBool(policy.AllowDeletions),
 	}
 
 }
@@ -42,10 +45,9 @@ func makeRequest(policy branchprotection.Policy) github.BranchProtectionRequest 
 func makeAdmins(val *bool) *bool {
 	if val != nil {
 		return val
-	} else {
-		no := false
-		return &no
 	}
+	no := false
+	return &no
 }
 
 // makeBool returns true iff *val == true

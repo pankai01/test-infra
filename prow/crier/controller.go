@@ -18,6 +18,7 @@ limitations under the License.
 package crier
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -26,6 +27,8 @@ import (
 	jsonpatch "github.com/evanphx/json-patch"
 	"github.com/sirupsen/logrus"
 
+	v1 "k8s.io/test-infra/prow/apis/prowjobs/v1"
+
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -33,7 +36,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
-	v1 "k8s.io/test-infra/prow/apis/prowjobs/v1"
 	clientset "k8s.io/test-infra/prow/client/clientset/versioned"
 	pjinformers "k8s.io/test-infra/prow/client/informers/externalversions/prowjobs/v1"
 )
@@ -62,25 +64,21 @@ func NewController(
 	queue workqueue.RateLimitingInterface,
 	informer pjinformers.ProwJobInformer,
 	reporter reportClient,
-	numWorkers int,
-	wg *sync.WaitGroup) *Controller {
+	numWorkers int) *Controller {
 	return &Controller{
 		pjclientset: pjclientset,
 		queue:       queue,
 		informer:    informer,
 		reporter:    reporter,
 		numWorkers:  numWorkers,
-		wg:          wg,
+		wg:          &sync.WaitGroup{},
 	}
 }
 
 // Run is the main path of execution for the controller loop.
-func (c *Controller) Run(stopCh <-chan struct{}) {
+func (c *Controller) Run(ctx context.Context) {
 	// handle a panic with logging and exiting
 	defer utilruntime.HandleCrash()
-	// ignore new items in the queue but when all goroutines
-	// have completed existing items then shutdown
-	defer c.queue.ShutDown()
 
 	logrus.Info("Initiating controller")
 	c.informer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -105,10 +103,10 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 	})
 
 	// run the informer to start listing and watching resources
-	go c.informer.Informer().Run(stopCh)
+	go c.informer.Informer().Run(ctx.Done())
 
 	// do the initial synchronization (one time) to populate resources
-	if !cache.WaitForCacheSync(stopCh, c.HasSynced) {
+	if !cache.WaitForCacheSync(ctx.Done(), c.HasSynced) {
 		utilruntime.HandleError(fmt.Errorf("Error syncing cache"))
 		return
 	}
@@ -116,12 +114,16 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 
 	// run the runWorker method every second with a stop channel
 	for i := 0; i < c.numWorkers; i++ {
-		go wait.Until(c.runWorker, time.Second, stopCh)
+		go wait.Until(c.runWorker, time.Second, ctx.Done())
 	}
 
 	logrus.Infof("Started %d workers", c.numWorkers)
-	<-stopCh
+	<-ctx.Done()
 	logrus.Info("Shutting down workers")
+	// ignore new items in the queue but when all goroutines
+	// have completed existing items then shutdown
+	c.queue.ShutDown()
+	c.wg.Wait()
 }
 
 // HasSynced allows us to satisfy the Controller interface by wiring up the informer's HasSynced
@@ -141,7 +143,7 @@ func (c *Controller) runWorker() {
 func (c *Controller) retry(key interface{}, err error) bool {
 	keyRaw := key.(string)
 	if c.queue.NumRequeues(key) < 5 {
-		logrus.WithError(err).WithField("prowjob", keyRaw).Error("Failed processing item, retrying")
+		logrus.WithError(err).WithField("prowjob", keyRaw).Info("Failed processing item, retrying")
 		c.queue.AddRateLimited(key)
 	} else {
 		logrus.WithError(err).WithField("prowjob", keyRaw).Error("Failed processing item, no more retries")
@@ -210,6 +212,7 @@ func (c *Controller) updateReportState(pj *v1.ProwJob) error {
 func (c *Controller) processNextItem() bool {
 	key, quit := c.queue.Get()
 	if quit {
+		logrus.Debug("Queue already shut down, exiting processNextItem")
 		return false
 	}
 
@@ -217,6 +220,8 @@ func (c *Controller) processNextItem() bool {
 
 	// assert the string out of the key (format `namespace/name`)
 	keyRaw := key.(string)
+	logrus.WithField("key", keyRaw).Debug("processing next key")
+
 	namespace, name, err := cache.SplitMetaNamespaceKey(keyRaw)
 	if err != nil {
 		logrus.WithError(err).WithField("prowjob", keyRaw).Error("invalid resource key")
@@ -234,7 +239,7 @@ func (c *Controller) processNextItem() bool {
 	// then we want to retry this particular queue key a certain
 	// number of times (5 here) before we forget the queue key
 	// and throw an error
-	pj, err := c.informer.Lister().ProwJobs(namespace).Get(name)
+	readOnlyPJ, err := c.informer.Lister().ProwJobs(namespace).Get(name)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			logrus.WithField("prowjob", keyRaw).Info("object no longer exist")
@@ -244,9 +249,10 @@ func (c *Controller) processNextItem() bool {
 
 		return c.retry(key, err)
 	}
+	pj := readOnlyPJ.DeepCopy()
 
 	// not belong to the current reporter
-	if !c.reporter.ShouldReport(pj) {
+	if !pj.Spec.Report || !c.reporter.ShouldReport(pj) {
 		c.queue.Forget(key)
 		return true
 	}

@@ -17,6 +17,8 @@ limitations under the License.
 package fakegithub
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"regexp"
 
@@ -97,8 +99,10 @@ type FakeClient struct {
 	ColumnIDMap map[string]map[int]string
 
 	// The project and column names for an issue or PR
-	Project string
-	Column  string
+	Project            string
+	Column             string
+	OrgRepoIssueLabels map[string][]github.Label
+	OrgProjects        map[string][]github.Project
 }
 
 // BotName returns authenticated login.
@@ -155,6 +159,11 @@ func (f *FakeClient) CreateComment(owner, repo string, number int, comment strin
 		User: github.User{Login: botName},
 	})
 	f.IssueCommentID++
+	return nil
+}
+
+// EditComment edits a comment. Its a stub that does nothing.
+func (f *FakeClient) EditComment(org, repo string, ID int, comment string) error {
 	return nil
 }
 
@@ -357,6 +366,12 @@ func (f *FakeClient) FindIssues(query, sort string, asc bool) ([]github.Issue, e
 	for _, issue := range f.Issues {
 		issues = append(issues, *issue)
 	}
+	for _, pr := range f.PullRequests {
+		issues = append(issues, github.Issue{
+			User:   pr.User,
+			Number: pr.Number,
+		})
+	}
 	return issues, nil
 }
 
@@ -507,6 +522,16 @@ func (f *FakeClient) CreateProjectCard(columnID int, projectCard github.ProjectC
 	}
 
 	for project, columnIDMap := range f.ColumnIDMap {
+		if _, exists := columnIDMap[columnID]; exists {
+			for id := range columnIDMap {
+				// Make sure that we behave same as github API
+				// Create project will generate an error when the card already exist in the project
+				card, err := f.GetColumnProjectCard(id, projectCard.ContentURL)
+				if err == nil && card != nil {
+					return nil, fmt.Errorf("Card already exist in the project: %s, column %d, cannot add to column  %d", project, id, columnID)
+				}
+			}
+		}
 		columnName, exists := columnIDMap[columnID]
 		if exists {
 			f.ColumnCardsMap[columnID] = append(
@@ -553,12 +578,22 @@ func (f *FakeClient) DeleteProjectCard(projectCardID int) error {
 	return nil
 }
 
-// GetColumnProjectCard fetches project card if the content_url in the card matched the issue/pr
-func (f *FakeClient) GetColumnProjectCard(columnID int, contentURL string) (*github.ProjectCard, error) {
+// GetColumnProjectCards fetches project cards  under given column
+func (f *FakeClient) GetColumnProjectCards(columnID int) ([]github.ProjectCard, error) {
 	if f.ColumnCardsMap == nil {
 		f.ColumnCardsMap = make(map[int][]github.ProjectCard)
 	}
-	for _, existingCard := range f.ColumnCardsMap[columnID] {
+	return f.ColumnCardsMap[columnID], nil
+}
+
+// GetColumnProjectCard fetches project card if the content_url in the card matched the issue/pr
+func (f *FakeClient) GetColumnProjectCard(columnID int, contentURL string) (*github.ProjectCard, error) {
+	cards, err := f.GetColumnProjectCards(columnID)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, existingCard := range cards {
 		if existingCard.ContentURL == contentURL {
 			return &existingCard, nil
 		}
@@ -635,4 +670,59 @@ func (f *FakeClient) TeamHasMember(teamID int, memberLogin string) (bool, error)
 		}
 	}
 	return false, nil
+}
+
+func (f *FakeClient) GetTeamBySlug(slug string, org string) (*github.Team, error) {
+	teams, _ := f.ListTeams(org)
+	for _, team := range teams {
+		if team.Name == slug {
+			return &team, nil
+		}
+	}
+	return &github.Team{}, nil
+}
+
+func (f *FakeClient) CreatePullRequest(org, repo, title, body, head, base string, canModify bool) (int, error) {
+	if f.PullRequests == nil {
+		f.PullRequests = map[int]*github.PullRequest{}
+	}
+	if f.Issues == nil {
+		f.Issues = map[int]*github.Issue{}
+	}
+	for i := 0; i < 999; i++ {
+		if f.PullRequests[i] != nil || f.Issues[i] != nil {
+			continue
+		}
+		f.PullRequests[i] = &github.PullRequest{
+			Number: i,
+			Base: github.PullRequestBranch{
+				Ref:  base,
+				Repo: github.Repo{Owner: github.User{Login: org}, Name: repo},
+			},
+		}
+		f.Issues[i] = &github.Issue{Number: i}
+		return i, nil
+	}
+
+	return 0, errors.New("FakeClient supports only 999 PullRequests")
+}
+
+func (f *FakeClient) UpdatePullRequest(org, repo string, number int, title, body *string, open *bool, branch *string, canModify *bool) error {
+	pr, found := f.PullRequests[number]
+	if !found {
+		return fmt.Errorf("no pr with number %d found", number)
+	}
+	if title != nil {
+		pr.Title = *title
+	}
+	if body != nil {
+		pr.Body = *body
+	}
+	return nil
+}
+
+// Query simply exists to allow the fake client to match the interface for packages that need it.
+// It does not modify the passed interface at all.
+func (f *FakeClient) Query(ctx context.Context, q interface{}, vars map[string]interface{}) error {
+	return nil
 }

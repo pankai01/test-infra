@@ -31,6 +31,7 @@ import (
 
 	"k8s.io/test-infra/prow/config"
 	"k8s.io/test-infra/prow/github"
+	_ "k8s.io/test-infra/prow/hook/plugin-imports"
 	"k8s.io/test-infra/prow/plugins"
 )
 
@@ -52,7 +53,7 @@ type Server struct {
 
 // ServeHTTP validates an incoming webhook and puts it into the event channel.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	eventType, eventGUID, payload, ok, resp := github.ValidateWebhook(w, r, s.TokenGenerator())
+	eventType, eventGUID, payload, ok, resp := github.ValidateWebhook(w, r, s.TokenGenerator)
 	if counter, err := s.Metrics.ResponseCounter.GetMetricWithLabelValues(strconv.Itoa(resp)); err != nil {
 		logrus.WithFields(logrus.Fields{
 			"status-code": resp,
@@ -74,7 +75,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) demuxEvent(eventType, eventGUID string, payload []byte, h http.Header) error {
 	l := logrus.WithFields(
 		logrus.Fields{
-			"event-type":     eventType,
+			eventTypeField:   eventType,
 			github.EventGUID: eventGUID,
 		},
 	)

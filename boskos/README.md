@@ -4,30 +4,30 @@
 ## Background
 [βοσκός](https://en.wiktionary.org/wiki/%CE%B2%CE%BF%CF%83%CE%BA%CF%8C%CF%82) - shepherd in greek!
 
-boskos is a resource manager service, that handles and manages different kind of resources and transition between different states.
+boskos is a resource manager service, that handles and manages different kind of resources and transition between
+different states.
 
 ## Introduction
 
-Boskos is inited with a config of resources, a list of resources by names. It's passed in by `-config`, usually as a config map.
+Boskos is inited with a config of resources, a list of resources by names. It's passed in by `-config`, usually as a
+config map.
 
-A resource yaml looks looks like:
+Boskos supports 2 types of resources, static and dynamic resources. Static resources are the one that depends on actual
+physical resources, meaning someone needs to physically create it, and add it to the list. Dynamic resources
+may depend on static resources. In the example bellow , aws-account is static resource, and aws-cluster is a dynamic
+resource that depends on having an aws-account. Once a cluster is created, AWS are in used, so admin might want to
+always have a minimum cluster available for testing, and might allow for more cluster to be created for spike usage.
 
 ```yaml
 ---
 resources:
+  # Static
   - type: "aws-account"
     state: free
     names:
     - "account1"
     - "account2"
-```
-
-For dynamic resources, ie resources that are created from static resources (See Mason), a specific config can be used:
-
-```yaml
----
-resources:
-  (...)
+  # Dynamic
   - type: "aws-cluster"
     state: dirty
     min-count: 1
@@ -38,16 +38,8 @@ resources:
     config:
       type: AWSClusterCreator
       content: "..."
+
 ```
-
-Boskos will take care of creating and naming the resources (if the current
-count is below min-count) and deleting the resources if they are expired or
-over max-count.
-
-All resource being deleted (due to config update or expiration) will be marked
-as `ToBeDeleted`. The cleaner component will mark them as `Tombstone` such that
-they can be safely deleted by Boskos. The cleaner will ensure that dynamic
-resources release other leased resources associated with it to prevent leaks.
 
 Type can be GCPProject, cluster, or even a dota2 server, anything that you
 want to be a group of resources. Name is a unique identifier of the resource.
@@ -60,6 +52,24 @@ final resource UserData. It is up to the implementation to parse the string into
 right struct. UserData can be updated using the update API call. All resource
 user data is returned as part of acquisition (calling acquire or acquirebystate)
 
+
+## Dynamic Resources
+
+As explain in the introduction, dynamic resources were introduced to reduce cost.
+
+If all resources are currently being used, and the count of resources is bellow Max,
+boskos will create new resources on Acquire. In order to take advantage of this,
+users need to specify a request ID in Acquire and keep using the same requestID
+until the resource is available.
+
+Boskos will take care of naming and creating resources (if the current
+count is below min-count) and deleting the resources if they are expired (lifetime
+option) or over max-count.
+
+All resource being deleted (due to config update or expiration) will be marked
+as `ToBeDeleted`. The cleaner component will mark them as `Tombstone` such that
+they can be safely deleted by Boskos. The cleaner will ensure that dynamic
+resources release other leased resources associated with it to prevent leaks.
 
 ## API
 
@@ -75,6 +85,13 @@ Use `/acquire` when you want to get hold of some resource.
 | `state` | `string` | current state of the requested resource     |
 | `dest`  | `string` | destination state of the requested resource |
 | `owner` | `string` | requester of the resource                   |
+
+#### Optional Parameters
+
+| Name         | Type     | Description                                   |
+| ------------ | -------- | --------------------------------------------- |
+| `request_id` | `string` | request id to use to keep your priority rank  |
+
 
 Example: `/acquire?type=gce-project&state=free&dest=busy&owner=user`.
 
@@ -259,7 +276,7 @@ curl 'http://127.0.0.1:8080/acquire?type=project&state=free&dest=busy&owner=user
 1. `make service`
 
 1. `kubectl create configmap -n test-pods resources --from-file=config=cfg.yaml`
-  See [`resources.yaml`](./resources.yaml) for an example of how the config file should look
+  See [`boskos-resources.yaml`](../prow/cluster/boskos-resources.yaml) for an example of how the config file should look
 
 1. `kubectl describe svc -n test-pods boskos` to make sure boskos is running
 

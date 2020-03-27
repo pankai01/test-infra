@@ -1,5 +1,9 @@
 # Testgrid
 
+NOTE: Most TestGrid code is moving to its new home in
+https://github.com/GoogleCloudPlatform/testgrid. See
+[#10409](https://github.com/kubernetes/test-infra/issues/10409) for more.
+
 The Kubernetes Testgrid instance is available at https://testgrid.k8s.io
 
 We have a short [video] from the testgrid session at the 2018 contributor summit.
@@ -101,18 +105,33 @@ Under **Options**
     vice versa) with more weight given to more recent transitions.
 *   **Sort by Name**: Sort alphabetically.
 
+## Clustered Failures
+
+You can display identified clustered failures in your test results grid in a
+dashboard tab. Select the ***Display Clustered Failures List*** toggle button to
+render a list/table of identified failure clusters at the bottom of the browser.
+
+Clusters can be grouped by:
+* test status
+* test status and error message
+
+The clustered failures table shows the test status, error message (if grouped by
+error message), and area of the clusters. The clusters are sorted by area in
+descending order.
+
+Selecting a row highlights the cells belonging to that cluster. Multiple row
+selection (with multiple cluster highlighting) is supported. To de-select a row,
+click on the selected row again.
+
 ## Configuration
 
 If you need to add a new test that you want TestGrid to display, or otherwise change what is shown
 on https://testgrid.k8s.io, see [Testgrid Configuration](config.md).
 
-The site is configured by [`config.yaml`].
 Updates to the config are automatically tested and pushed to production.
 
 ## Contributing
 
 If you want to modify TestGrid beyond adding new tests or dashboards, see [Updating Testgrid](build_test_update.md).
 
-[`config.proto`]: ./config/config.proto
-[`config.yaml`]: ./config.yaml
 [video]: https://www.youtube.com/watch?v=jm2l2SLq_yE

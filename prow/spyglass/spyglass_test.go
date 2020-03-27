@@ -20,25 +20,26 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"k8s.io/test-infra/prow/gcsupload"
-	"k8s.io/test-infra/prow/pod-utils/downwardapi"
 	"os"
 	"reflect"
 	"sort"
 	"strings"
 	"testing"
 
+	"k8s.io/test-infra/prow/gcsupload"
+	"k8s.io/test-infra/prow/pod-utils/downwardapi"
+
 	"github.com/fsouza/fake-gcs-server/fakestorage"
 	"github.com/sirupsen/logrus"
 	coreapi "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	tgconf "github.com/GoogleCloudPlatform/testgrid/pb/config"
 	prowapi "k8s.io/test-infra/prow/apis/prowjobs/v1"
 	"k8s.io/test-infra/prow/config"
 	"k8s.io/test-infra/prow/deck/jobs"
 	"k8s.io/test-infra/prow/kube"
 	"k8s.io/test-infra/prow/spyglass/lenses"
-	tgconf "k8s.io/test-infra/testgrid/config"
 )
 
 var (
@@ -242,7 +243,7 @@ func TestViews(t *testing.T) {
 					},
 				},
 			}
-			sg := New(fakeJa, c.Config, fakeGCSClient, "", context.Background())
+			sg := New(context.Background(), fakeJa, c.Config, fakeGCSClient, "", false)
 			_, ls := sg.Lenses(tc.lenses)
 			for _, l := range ls {
 				var found bool
@@ -438,7 +439,7 @@ func TestJobPath(t *testing.T) {
 	for _, tc := range testCases {
 		fakeGCSClient := fakeGCSServer.Client()
 		fca := config.Agent{}
-		sg := New(fakeJa, fca.Config, fakeGCSClient, "", context.Background())
+		sg := New(context.Background(), fakeJa, fca.Config, fakeGCSClient, "", false)
 		jobPath, err := sg.JobPath(tc.src)
 		if tc.expError && err == nil {
 			t.Errorf("test %q: JobPath(%q) expected error", tc.name, tc.src)
@@ -564,7 +565,7 @@ func TestProwJobName(t *testing.T) {
 	for _, tc := range testCases {
 		fakeGCSClient := fakeGCSServer.Client()
 		fca := config.Agent{}
-		sg := New(fakeJa, fca.Config, fakeGCSClient, "", context.Background())
+		sg := New(context.Background(), fakeJa, fca.Config, fakeGCSClient, "", false)
 		jobPath, err := sg.ProwJobName(tc.src)
 		if tc.expError && err == nil {
 			t.Errorf("test %q: JobPath(%q) expected error", tc.name, tc.src)
@@ -689,7 +690,7 @@ func TestRunPath(t *testing.T) {
 				},
 			},
 		})
-		sg := New(fakeJa, fca.Config, fakeGCSClient, "", context.Background())
+		sg := New(context.Background(), fakeJa, fca.Config, fakeGCSClient, "", false)
 		jobPath, err := sg.RunPath(tc.src)
 		if tc.expError && err == nil {
 			t.Errorf("test %q: RunPath(%q) expected error, got  %q", tc.name, tc.src, jobPath)
@@ -836,18 +837,20 @@ func TestRunToPR(t *testing.T) {
 		fca.Set(&config.Config{
 			ProwConfig: config.ProwConfig{
 				Plank: config.Plank{
-					DefaultDecorationConfig: &prowapi.DecorationConfig{
-						GCSConfiguration: &prowapi.GCSConfiguration{
-							Bucket:       "kubernetes-jenkins",
-							DefaultOrg:   "kubernetes",
-							DefaultRepo:  "kubernetes",
-							PathStrategy: "legacy",
+					DefaultDecorationConfigs: map[string]*prowapi.DecorationConfig{
+						"*": {
+							GCSConfiguration: &prowapi.GCSConfiguration{
+								Bucket:       "kubernetes-jenkins",
+								DefaultOrg:   "kubernetes",
+								DefaultRepo:  "kubernetes",
+								PathStrategy: "legacy",
+							},
 						},
 					},
 				},
 			},
 		})
-		sg := New(fakeJa, fca.Config, fakeGCSClient, "", context.Background())
+		sg := New(context.Background(), fakeJa, fca.Config, fakeGCSClient, "", false)
 		org, repo, num, err := sg.RunToPR(tc.src)
 		if tc.expError && err == nil {
 			t.Errorf("test %q: RunToPR(%q) expected error", tc.name, tc.src)
@@ -934,7 +937,7 @@ func TestProwToGCS(t *testing.T) {
 		}
 		fakeJa = jobs.NewJobAgent(kc, map[string]jobs.PodLogClient{kube.DefaultClusterAlias: fpkc("clusterA"), "trusted": fpkc("clusterB")}, fakeConfigAgent.Config)
 		fakeJa.Start()
-		sg := New(fakeJa, fakeConfigAgent.Config, fakeGCSClient, "", context.Background())
+		sg := New(context.Background(), fakeJa, fakeConfigAgent.Config, fakeGCSClient, "", false)
 
 		p, err := sg.prowToGCS(tc.key)
 		if err != nil && !tc.expectError {
@@ -1052,10 +1055,12 @@ func TestGCSPathRoundTrip(t *testing.T) {
 			c: config.Config{
 				ProwConfig: config.ProwConfig{
 					Plank: config.Plank{
-						DefaultDecorationConfig: &prowapi.DecorationConfig{
-							GCSConfiguration: &prowapi.GCSConfiguration{
-								DefaultOrg:  tc.defaultOrg,
-								DefaultRepo: tc.defaultRepo,
+						DefaultDecorationConfigs: map[string]*prowapi.DecorationConfig{
+							"*": {
+								GCSConfiguration: &prowapi.GCSConfiguration{
+									DefaultOrg:  tc.defaultOrg,
+									DefaultRepo: tc.defaultRepo,
+								},
 							},
 						},
 					},
@@ -1067,7 +1072,7 @@ func TestGCSPathRoundTrip(t *testing.T) {
 
 		fakeGCSClient := fakeGCSServer.Client()
 
-		sg := New(fakeJa, fakeConfigAgent.Config, fakeGCSClient, "", context.Background())
+		sg := New(context.Background(), fakeJa, fakeConfigAgent.Config, fakeGCSClient, "", false)
 		gcspath, _, _ := gcsupload.PathsForJob(
 			&prowapi.GCSConfiguration{Bucket: "test-bucket", PathStrategy: tc.pathStrategy},
 			&downwardapi.JobSpec{
@@ -1179,7 +1184,7 @@ func TestTestGridLink(t *testing.T) {
 				},
 			},
 		})
-		sg := New(fakeJa, fca.Config, fakeGCSClient, "", context.Background())
+		sg := New(context.Background(), fakeJa, fca.Config, fakeGCSClient, "", false)
 		sg.testgrid = &tg
 		link, err := sg.TestGridLink(tc.src)
 		if tc.expError {
@@ -1226,7 +1231,7 @@ func TestFetchArtifactsPodLog(t *testing.T) {
 
 	fakeGCSClient := fakeGCSServer.Client()
 
-	sg := New(fakeJa, fakeConfigAgent.Config, fakeGCSClient, "", context.Background())
+	sg := New(context.Background(), fakeJa, fakeConfigAgent.Config, fakeGCSClient, "", false)
 	testKeys := []string{
 		"prowjob/job/123",
 		"gcs/kubernetes-jenkins/logs/job/123/",
@@ -1384,7 +1389,7 @@ func TestResolveSymlink(t *testing.T) {
 
 		fakeGCSClient := fakeGCSServer.Client()
 
-		sg := New(fakeJa, fakeConfigAgent.Config, fakeGCSClient, "", context.Background())
+		sg := New(context.Background(), fakeJa, fakeConfigAgent.Config, fakeGCSClient, "", false)
 
 		result, err := sg.ResolveSymlink(tc.path)
 		if err != nil {
@@ -1476,7 +1481,7 @@ func TestExtraLinks(t *testing.T) {
 			fakeConfigAgent := fca{}
 			fakeJa = jobs.NewJobAgent(fkc{}, map[string]jobs.PodLogClient{kube.DefaultClusterAlias: fpkc("clusterA")}, fakeConfigAgent.Config)
 			fakeJa.Start()
-			sg := New(fakeJa, fakeConfigAgent.Config, gcsClient, "", context.Background())
+			sg := New(context.Background(), fakeJa, fakeConfigAgent.Config, gcsClient, "", false)
 
 			result, err := sg.ExtraLinks("gcs/test-bucket/logs/some-job/42")
 			if err != nil {

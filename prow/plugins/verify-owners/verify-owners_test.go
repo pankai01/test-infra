@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/test-infra/prow/config"
 	"k8s.io/test-infra/prow/git/localgit"
 	"k8s.io/test-infra/prow/github"
 	"k8s.io/test-infra/prow/github/fakegithub"
@@ -135,10 +136,13 @@ func IssueLabelsAddedContain(arr []string, str string) bool {
 	return false
 }
 
-func newFakeGitHubClient(files []string, pr int) *fakegithub.FakeClient {
+func newFakeGitHubClient(changed []string, removed []string, pr int) *fakegithub.FakeClient {
 	var changes []github.PullRequestChange
-	for _, file := range files {
+	for _, file := range changed {
 		changes = append(changes, github.PullRequestChange{Filename: file})
+	}
+	for _, file := range removed {
+		changes = append(changes, github.PullRequestChange{Filename: file, Status: github.PullRequestFileRemoved})
 	}
 	return &fakegithub.FakeClient{
 		PullRequestChanges: map[int][]github.PullRequestChange{pr: changes},
@@ -240,16 +244,41 @@ func (foc *fakeOwnersClient) ParseFullConfig(path string) (repoowners.FullConfig
 	return *full, err
 }
 
+func (foc *fakeOwnersClient) TopLevelApprovers() sets.String {
+	return sets.String{}
+}
+
 func makeFakeRepoOwnersClient() fakeRepoownersClient {
 	return fakeRepoownersClient{
 		foc: &fakeOwnersClient{},
 	}
 }
 
+func addFilesToRepo(lg *localgit.LocalGit, paths []string, ownersFile string) error {
+	origFiles := map[string][]byte{}
+	for _, file := range paths {
+		if strings.Contains(file, "OWNERS") {
+			origFiles[file] = ownerFiles[ownersFile]
+		} else {
+			origFiles[file] = []byte("foo")
+		}
+	}
+	return lg.AddCommit("org", "repo", origFiles)
+}
+
 func TestHandle(t *testing.T) {
+	testHandle(localgit.New, t)
+}
+
+func TestHandleV2(t *testing.T) {
+	testHandle(localgit.NewV2, t)
+}
+
+func testHandle(clients localgit.Clients, t *testing.T) {
 	var tests = []struct {
 		name         string
 		filesChanged []string
+		filesRemoved []string
 		ownersFile   string
 		shouldLabel  bool
 	}{
@@ -337,8 +366,18 @@ func TestHandle(t *testing.T) {
 			ownersFile:   "noApproversFilters",
 			shouldLabel:  false,
 		},
+		{
+			name:         "OWNERS file was removed",
+			filesRemoved: []string{"pkg/OWNERS"},
+			ownersFile:   "valid",
+			shouldLabel:  false,
+		}, {
+			name:         "OWNERS_ALIASES file was removed",
+			filesRemoved: []string{"OWNERS_ALIASES"},
+			shouldLabel:  false,
+		},
 	}
-	lg, c, err := localgit.New()
+	lg, c, err := clients()
 	if err != nil {
 		t.Fatalf("Making localgit: %v", err)
 	}
@@ -359,35 +398,40 @@ func TestHandle(t *testing.T) {
 		if err := lg.Checkout("org", "repo", "master"); err != nil {
 			t.Fatalf("Switching to master branch: %v", err)
 		}
+		if len(test.filesRemoved) > 0 {
+			if err := addFilesToRepo(lg, test.filesRemoved, test.ownersFile); err != nil {
+				t.Fatalf("Adding base commit: %v", err)
+			}
+		}
+
 		if err := lg.CheckoutNewBranch("org", "repo", fmt.Sprintf("pull/%d/head", pr)); err != nil {
 			t.Fatalf("Checking out pull branch: %v", err)
 		}
-		pullFiles := map[string][]byte{}
-		for _, file := range test.filesChanged {
-			if strings.Contains(file, "OWNERS") {
-				pullFiles[file] = ownerFiles[test.ownersFile]
-			} else {
-				pullFiles[file] = []byte("foo")
+
+		if len(test.filesChanged) > 0 {
+			if err := addFilesToRepo(lg, test.filesChanged, test.ownersFile); err != nil {
+				t.Fatalf("Adding PR commit: %v", err)
 			}
 		}
-		if err := lg.AddCommit("org", "repo", pullFiles); err != nil {
-			t.Fatalf("Adding PR commit: %v", err)
+		if len(test.filesRemoved) > 0 {
+			if err := lg.RmCommit("org", "repo", test.filesRemoved); err != nil {
+				t.Fatalf("Adding PR commit (removing files): %v", err)
+			}
 		}
+
 		sha, err := lg.RevParse("org", "repo", "HEAD")
 		if err != nil {
 			t.Fatalf("Getting commit SHA: %v", err)
 		}
 		pre := &github.PullRequestEvent{
-			Number: pr,
 			PullRequest: github.PullRequest{
 				User: github.User{Login: "author"},
 				Head: github.PullRequestBranch{
 					SHA: sha,
 				},
 			},
-			Repo: github.Repo{FullName: "org/repo"},
 		}
-		fghc := newFakeGitHubClient(test.filesChanged, pr)
+		fghc := newFakeGitHubClient(test.filesChanged, test.filesRemoved, pr)
 		fghc.PullRequests = map[int]*github.PullRequest{}
 		fghc.PullRequests[pr] = &github.PullRequest{
 			Base: github.PullRequestBranch{
@@ -395,7 +439,14 @@ func TestHandle(t *testing.T) {
 			},
 		}
 
-		if err := handle(fghc, c, makeFakeRepoOwnersClient(), logrus.WithField("plugin", PluginName), pre, []string{labels.Approved, labels.LGTM}, plugins.Trigger{}, false, &fakePruner{}); err != nil {
+		prInfo := info{
+			org:          "org",
+			repo:         "repo",
+			repoFullName: "org/repo",
+			number:       pr,
+		}
+
+		if err := handle(fghc, c, makeFakeRepoOwnersClient(), logrus.WithField("plugin", PluginName), &pre.PullRequest, prInfo, []string{labels.Approved, labels.LGTM}, plugins.Trigger{}, false, &fakePruner{}); err != nil {
 			t.Fatalf("Handle PR: %v", err)
 		}
 		if !test.shouldLabel && IssueLabelsAddedContain(fghc.IssueLabelsAdded, labels.InvalidOwners) {
@@ -409,6 +460,14 @@ func TestHandle(t *testing.T) {
 }
 
 func TestParseOwnersFile(t *testing.T) {
+	testParseOwnersFile(localgit.New, t)
+}
+
+func TestParseOwnersFileV2(t *testing.T) {
+	testParseOwnersFile(localgit.NewV2, t)
+}
+
+func testParseOwnersFile(clients localgit.Clients, t *testing.T) {
 	tests := []struct {
 		name     string
 		document []byte
@@ -471,7 +530,7 @@ func TestParseOwnersFile(t *testing.T) {
 	for i, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			pr := i + 1
-			lg, c, err := localgit.New()
+			lg, c, err := clients()
 			if err != nil {
 				t.Fatalf("Making localgit: %v", err)
 			}
@@ -507,7 +566,7 @@ func TestParseOwnersFile(t *testing.T) {
 				Patch:    test.patch,
 			}
 
-			r, err := c.Clone("org/repo")
+			r, err := c.ClientFor("org", "repo")
 			if err != nil {
 				t.Fatalf("error cloning the repo: %v", err)
 			}
@@ -517,7 +576,7 @@ func TestParseOwnersFile(t *testing.T) {
 				}
 			}()
 
-			path := filepath.Join(r.Dir, "OWNERS")
+			path := filepath.Join(r.Directory(), "OWNERS")
 			message, _ := parseOwnersFile(&fakeOwnersClient{}, path, change, &logrus.Entry{}, []string{})
 			if message != nil {
 				if test.errLine == 0 {
@@ -540,28 +599,21 @@ func makePatch(b []byte) string {
 }
 
 func TestHelpProvider(t *testing.T) {
+	enabledRepos := []config.OrgRepo{
+		{Org: "org1", Repo: "repo"},
+		{Org: "org2", Repo: "repo"},
+	}
 	cases := []struct {
 		name               string
 		config             *plugins.Configuration
-		enabledRepos       []string
+		enabledRepos       []config.OrgRepo
 		err                bool
 		configInfoIncludes []string
 	}{
 		{
 			name:         "Empty config",
 			config:       &plugins.Configuration{},
-			enabledRepos: []string{"org1", "org2/repo"},
-		},
-		{
-			name:         "Overlapping org and org/repo",
-			config:       &plugins.Configuration{},
-			enabledRepos: []string{"org2", "org2/repo"},
-		},
-		{
-			name:         "Invalid enabledRepos",
-			config:       &plugins.Configuration{},
-			enabledRepos: []string{"org1", "org2/repo/extra"},
-			err:          true,
+			enabledRepos: enabledRepos,
 		},
 		{
 			name: "ReviewerCount specified",
@@ -570,7 +622,7 @@ func TestHelpProvider(t *testing.T) {
 					LabelsBlackList: []string{"label1", "label2"},
 				},
 			},
-			enabledRepos:       []string{"org1", "org2/repo"},
+			enabledRepos:       enabledRepos,
 			configInfoIncludes: []string{"label1, label2"},
 		},
 	}
@@ -590,7 +642,7 @@ func TestHelpProvider(t *testing.T) {
 }
 
 var ownersFiles = map[string][]byte{
-	"nonCollaboratorAdditions": []byte(`reviewers:
+	"nonCollaborators": []byte(`reviewers:
 - phippy
 - alice
 approvers:
@@ -613,39 +665,67 @@ approvers:
 }
 
 var ownersPatch = map[string]string{
+	"collaboratorAdditions": `@@ -1,4 +1,6 @@
+ reviewers:
+ - phippy
++- alice
+ approvers:
+ - zee
++- bob
+`,
+	"collaboratorRemovals": `@@ -1,8 +1,6 @@
+ reviewers:
+ - phippy
+ - alice
+-- bob
+ approvers:
+ - zee
+ - bob
+-- alice
+`,
 	"nonCollaboratorAdditions": `@@ -1,4 +1,6 @@
-reviewers:
+ reviewers:
 +- phippy
-- alice
-approvers:
+ - alice
+ approvers:
 +- zee
-- bob
+ - bob
+`,
+	"nonCollaboratorRemovals": `@@ -1,8 +1,6 @@
+ reviewers:
+ - phippy
+ - alice
+-- al
+ approvers:
+ - zee
+ - bob
+-- bo
 `,
 	"nonCollaboratorsWithAliases": `@@ -1,4 +1,6 @@
-reviewers:
+ reviewers:
 +- foo-reviewers
-- alice
+ - alice
 +- goldie
-approvers:
-- bob
+ approvers:
+ - bob
 `,
-	"collaboratorsWtihAliases": `@@ -1,2 +1,5 @@
+	"collaboratorsWithAliases": `@@ -1,2 +1,5 @@
 +reviewers:
 +- foo-reviewers
 +- alice
-approvers:
-- bob
+ approvers:
+ - bob
 `,
 }
 
 var ownersAliases = map[string][]byte{
-	"nonCollaboratorAdditions": []byte(`aliases:
+	"nonCollaborators": []byte(`aliases:
   foo-reviewers:
   - alice
   - phippy
   - zee
 `),
-	"collaboratorAdditions": []byte(`aliases:
+	"collaborators": []byte(`aliases:
   foo-reviewers:
   - alice
 `),
@@ -653,20 +733,46 @@ var ownersAliases = map[string][]byte{
 
 var ownersAliasesPatch = map[string]string{
 	"nonCollaboratorAdditions": `@@ -1,3 +1,5 @@
-aliases:
-  foo-reviewers:
-  - alice
-+ - phippy
-+ - zee
+ aliases:
+   foo-reviewers:
+   - alice
++  - phippy
++  - zee
 `,
-	"collaboratorAdditions": `@@ -0,0 +1,3 @@
-+aliases:
-+ foo-reviewers:
-+ - alice
+	"nonCollaboratorRemovals": `@@ -1,6 +1,5 @@
+ aliases:
+   foo-reviewers:
+   - alice
+-  - al
+   - phippy
+   - zee
+`,
+	"collaboratorAdditions": `@@ -1,4 +1,5 @@
+ aliases:
+   foo-reviewers:
++  - alice
+   - phippy
+   - zee
+`,
+	"collaboratorRemovals": `@@ -1,6 +1,5 @@
+ aliases:
+   foo-reviewers:
+   - alice
+-  - bob
+   - phippy
+   - zee
 `,
 }
 
 func TestNonCollaborators(t *testing.T) {
+	testNonCollaborators(localgit.New, t)
+}
+
+func TestNonCollaboratorsV2(t *testing.T) {
+	testNonCollaborators(localgit.NewV2, t)
+}
+
+func testNonCollaborators(clients localgit.Clients, t *testing.T) {
 	var tests = []struct {
 		name                 string
 		filesChanged         []string
@@ -680,17 +786,41 @@ func TestNonCollaborators(t *testing.T) {
 		shouldComment        bool
 	}{
 		{
+			name:          "collaborators additions in OWNERS file",
+			filesChanged:  []string{"OWNERS"},
+			ownersFile:    "nonCollaborators",
+			ownersPatch:   "collaboratorAdditions",
+			shouldLabel:   false,
+			shouldComment: false,
+		},
+		{
+			name:          "collaborators removals in OWNERS file",
+			filesChanged:  []string{"OWNERS"},
+			ownersFile:    "nonCollaborators",
+			ownersPatch:   "collaboratorRemovals",
+			shouldLabel:   false,
+			shouldComment: false,
+		},
+		{
 			name:          "non-collaborators additions in OWNERS file",
 			filesChanged:  []string{"OWNERS"},
-			ownersFile:    "nonCollaboratorAdditions",
+			ownersFile:    "nonCollaborators",
 			ownersPatch:   "nonCollaboratorAdditions",
 			shouldLabel:   true,
 			shouldComment: true,
 		},
 		{
+			name:          "non-collaborators removal in OWNERS file",
+			filesChanged:  []string{"OWNERS"},
+			ownersFile:    "nonCollaborators",
+			ownersPatch:   "nonCollaboratorRemovals",
+			shouldLabel:   false,
+			shouldComment: false,
+		},
+		{
 			name:                 "non-collaborators additions in OWNERS file, with skipTrustedUserCheck=true",
 			filesChanged:         []string{"OWNERS"},
-			ownersFile:           "nonCollaboratorAdditions",
+			ownersFile:           "nonCollaborators",
 			ownersPatch:          "nonCollaboratorAdditions",
 			skipTrustedUserCheck: true,
 			shouldLabel:          false,
@@ -700,16 +830,43 @@ func TestNonCollaborators(t *testing.T) {
 			name:               "non-collaborators additions in OWNERS_ALIASES file",
 			filesChanged:       []string{"OWNERS_ALIASES"},
 			ownersFile:         "collaboratorsWithAliases",
-			ownersAliasesFile:  "nonCollaboratorAdditions",
+			ownersAliasesFile:  "nonCollaborators",
 			ownersAliasesPatch: "nonCollaboratorAdditions",
 			shouldLabel:        true,
 			shouldComment:      true,
 		},
 		{
+			name:               "non-collaborators removals in OWNERS_ALIASES file",
+			filesChanged:       []string{"OWNERS_ALIASES"},
+			ownersFile:         "collaboratorsWithAliases",
+			ownersAliasesFile:  "nonCollaborators",
+			ownersAliasesPatch: "nonCollaboratorRemovals",
+			shouldLabel:        false,
+			shouldComment:      false,
+		},
+		{
+			name:               "collaborators additions in OWNERS_ALIASES file",
+			filesChanged:       []string{"OWNERS_ALIASES"},
+			ownersFile:         "collaboratorsWithAliases",
+			ownersAliasesFile:  "nonCollaborators",
+			ownersAliasesPatch: "collaboratorAdditions",
+			shouldLabel:        false,
+			shouldComment:      false,
+		},
+		{
+			name:               "collaborators removals in OWNERS_ALIASES file",
+			filesChanged:       []string{"OWNERS_ALIASES"},
+			ownersFile:         "collaboratorsWithAliases",
+			ownersAliasesFile:  "nonCollaborators",
+			ownersAliasesPatch: "collaboratorRemovals",
+			shouldLabel:        false,
+			shouldComment:      false,
+		},
+		{
 			name:                 "non-collaborators additions in OWNERS_ALIASES file, with skipTrustedUserCheck=true",
 			filesChanged:         []string{"OWNERS_ALIASES"},
 			ownersFile:           "collaboratorsWithAliases",
-			ownersAliasesFile:    "nonCollaboratorAdditions",
+			ownersAliasesFile:    "nonCollaborators",
 			ownersAliasesPatch:   "nonCollaboratorAdditions",
 			skipTrustedUserCheck: true,
 			shouldLabel:          false,
@@ -720,7 +877,7 @@ func TestNonCollaborators(t *testing.T) {
 			filesChanged:       []string{"OWNERS", "OWNERS_ALIASES"},
 			ownersFile:         "nonCollaboratorsWithAliases",
 			ownersPatch:        "nonCollaboratorsWithAliases",
-			ownersAliasesFile:  "nonCollaboratorAdditions",
+			ownersAliasesFile:  "nonCollaborators",
 			ownersAliasesPatch: "nonCollaboratorAdditions",
 			shouldLabel:        true,
 			shouldComment:      true,
@@ -729,8 +886,8 @@ func TestNonCollaborators(t *testing.T) {
 			name:               "collaborator additions in both OWNERS and OWNERS_ALIASES file",
 			filesChanged:       []string{"OWNERS", "OWNERS_ALIASES"},
 			ownersFile:         "collaboratorsWithAliases",
-			ownersPatch:        "collaboratorsWtihAliases",
-			ownersAliasesFile:  "collaboratorAdditions",
+			ownersPatch:        "collaboratorsWithAliases",
+			ownersAliasesFile:  "collaborators",
 			ownersAliasesPatch: "collaboratorAdditions",
 			shouldLabel:        false,
 			shouldComment:      false,
@@ -738,7 +895,7 @@ func TestNonCollaborators(t *testing.T) {
 		{
 			name:          "non-collaborators additions in OWNERS file in vendor subdir",
 			filesChanged:  []string{"vendor/k8s.io/client-go/OWNERS"},
-			ownersFile:    "nonCollaboratorAdditions",
+			ownersFile:    "nonCollaborators",
 			ownersPatch:   "nonCollaboratorAdditions",
 			shouldLabel:   false,
 			shouldComment: false,
@@ -746,7 +903,7 @@ func TestNonCollaborators(t *testing.T) {
 		{
 			name:                "non-collaborators additions in OWNERS file in vendor subdir, but include it",
 			filesChanged:        []string{"vendor/k8s.io/client-go/OWNERS"},
-			ownersFile:          "nonCollaboratorAdditions",
+			ownersFile:          "nonCollaborators",
 			ownersPatch:         "nonCollaboratorAdditions",
 			includeVendorOwners: true,
 			shouldLabel:         true,
@@ -755,13 +912,13 @@ func TestNonCollaborators(t *testing.T) {
 		{
 			name:          "non-collaborators additions in OWNERS file in vendor dir",
 			filesChanged:  []string{"vendor/OWNERS"},
-			ownersFile:    "nonCollaboratorAdditions",
+			ownersFile:    "nonCollaborators",
 			ownersPatch:   "nonCollaboratorAdditions",
 			shouldLabel:   true,
 			shouldComment: true,
 		},
 	}
-	lg, c, err := localgit.New()
+	lg, c, err := clients()
 	if err != nil {
 		t.Fatalf("Making localgit: %v", err)
 	}
@@ -812,16 +969,14 @@ func TestNonCollaborators(t *testing.T) {
 			t.Fatalf("Getting commit SHA: %v", err)
 		}
 		pre := &github.PullRequestEvent{
-			Number: pr,
 			PullRequest: github.PullRequest{
 				User: github.User{Login: "author"},
 				Head: github.PullRequestBranch{
 					SHA: sha,
 				},
 			},
-			Repo: github.Repo{FullName: "org/repo"},
 		}
-		fghc := newFakeGitHubClient(test.filesChanged, pr)
+		fghc := newFakeGitHubClient(test.filesChanged, nil, pr)
 		fghc.PullRequestChanges[pr] = changes
 
 		fghc.PullRequests = map[int]*github.PullRequest{}
@@ -842,7 +997,14 @@ func TestNonCollaborators(t *testing.T) {
 			froc.foc.dirBlacklist = blacklist
 		}
 
-		if err := handle(fghc, c, froc, logrus.WithField("plugin", PluginName), pre, []string{labels.Approved, labels.LGTM}, plugins.Trigger{}, test.skipTrustedUserCheck, &fakePruner{}); err != nil {
+		prInfo := info{
+			org:          "org",
+			repo:         "repo",
+			repoFullName: "org/repo",
+			number:       pr,
+		}
+
+		if err := handle(fghc, c, froc, logrus.WithField("plugin", PluginName), &pre.PullRequest, prInfo, []string{labels.Approved, labels.LGTM}, plugins.Trigger{}, test.skipTrustedUserCheck, &fakePruner{}); err != nil {
 			t.Fatalf("Handle PR: %v", err)
 		}
 		if !test.shouldLabel && IssueLabelsAddedContain(fghc.IssueLabelsAdded, labels.InvalidOwners) {
@@ -858,4 +1020,170 @@ func TestNonCollaborators(t *testing.T) {
 			t.Errorf("%s: expected comment but didn't receive", test.name)
 		}
 	}
+}
+
+func TestHandleGenericComment(t *testing.T) {
+	testHandleGenericComment(localgit.New, t)
+}
+
+func TestHandleGenericCommentV2(t *testing.T) {
+	testHandleGenericComment(localgit.NewV2, t)
+}
+
+func testHandleGenericComment(clients localgit.Clients, t *testing.T) {
+	var tests = []struct {
+		name         string
+		commentEvent github.GenericCommentEvent
+		filesChanged []string
+		filesRemoved []string
+		ownersFile   string
+		shouldLabel  bool
+	}{
+		{
+			name: "no OWNERS file",
+			commentEvent: github.GenericCommentEvent{
+				Action:     github.GenericCommentActionCreated,
+				IssueState: "open",
+				IsPR:       true,
+				Body:       "/verify-owners",
+			},
+			filesChanged: []string{"a.go", "b.go"},
+			ownersFile:   "valid",
+			shouldLabel:  false,
+		},
+		{
+			name: "good OWNERS file",
+			commentEvent: github.GenericCommentEvent{
+				Action:     github.GenericCommentActionCreated,
+				IssueState: "open",
+				IsPR:       true,
+				Body:       "/verify-owners",
+			},
+			filesChanged: []string{"OWNERS", "b.go"},
+			ownersFile:   "valid",
+			shouldLabel:  false,
+		},
+		{
+			name: "invalid syntax OWNERS file",
+			commentEvent: github.GenericCommentEvent{
+				Action:     github.GenericCommentActionCreated,
+				IssueState: "open",
+				IsPR:       true,
+				Body:       "/verify-owners",
+			},
+			filesChanged: []string{"OWNERS", "b.go"},
+			ownersFile:   "invalidSyntax",
+			shouldLabel:  true,
+		},
+		{
+			name: "invalid syntax OWNERS file, unrelated comment",
+			commentEvent: github.GenericCommentEvent{
+				Action: github.GenericCommentActionCreated,
+				IsPR:   true,
+				Body:   "/verify owners",
+			},
+			filesChanged: []string{"OWNERS", "b.go"},
+			ownersFile:   "invalidSyntax",
+			shouldLabel:  false,
+		},
+		{
+			name: "invalid syntax OWNERS file, comment edited",
+			commentEvent: github.GenericCommentEvent{
+				Action: github.GenericCommentActionEdited,
+				IsPR:   true,
+				Body:   "/verify-owners",
+			},
+			filesChanged: []string{"OWNERS", "b.go"},
+			ownersFile:   "invalidSyntax",
+			shouldLabel:  false,
+		},
+		{
+			name: "invalid syntax OWNERS file, comment on an issue",
+			commentEvent: github.GenericCommentEvent{
+				Action: github.GenericCommentActionCreated,
+				IsPR:   false,
+				Body:   "/verify-owners",
+			},
+			filesChanged: []string{"OWNERS", "b.go"},
+			ownersFile:   "invalidSyntax",
+			shouldLabel:  false,
+		},
+	}
+
+	lg, c, err := clients()
+	if err != nil {
+		t.Fatalf("Making localgit: %v", err)
+	}
+	defer func() {
+		if err := lg.Clean(); err != nil {
+			t.Errorf("Cleaning up localgit: %v", err)
+		}
+		if err := c.Clean(); err != nil {
+			t.Errorf("Cleaning up client: %v", err)
+		}
+	}()
+	if err := lg.MakeFakeRepo("org", "repo"); err != nil {
+		t.Fatalf("Making fake repo: %v", err)
+	}
+	for i, test := range tests {
+		pr := i + 1
+		// make sure we're on master before branching
+		if err := lg.Checkout("org", "repo", "master"); err != nil {
+			t.Fatalf("Switching to master branch: %v", err)
+		}
+		if len(test.filesRemoved) > 0 {
+			if err := addFilesToRepo(lg, test.filesRemoved, test.ownersFile); err != nil {
+				t.Fatalf("Adding base commit: %v", err)
+			}
+		}
+
+		if err := lg.CheckoutNewBranch("org", "repo", fmt.Sprintf("pull/%d/head", pr)); err != nil {
+			t.Fatalf("Checking out pull branch: %v", err)
+		}
+
+		if len(test.filesChanged) > 0 {
+			if err := addFilesToRepo(lg, test.filesChanged, test.ownersFile); err != nil {
+				t.Fatalf("Adding PR commit: %v", err)
+			}
+		}
+		if len(test.filesRemoved) > 0 {
+			if err := lg.RmCommit("org", "repo", test.filesRemoved); err != nil {
+				t.Fatalf("Adding PR commit (removing files): %v", err)
+			}
+		}
+
+		sha, err := lg.RevParse("org", "repo", "HEAD")
+		if err != nil {
+			t.Fatalf("Getting commit SHA: %v", err)
+		}
+
+		test.commentEvent.Repo.Owner.Login = "org"
+		test.commentEvent.Repo.Name = "repo"
+		test.commentEvent.Repo.FullName = "org/repo"
+		test.commentEvent.Number = pr
+
+		fghc := newFakeGitHubClient(test.filesChanged, test.filesRemoved, pr)
+		fghc.PullRequests = map[int]*github.PullRequest{}
+		fghc.PullRequests[pr] = &github.PullRequest{
+			User: github.User{Login: "author"},
+			Head: github.PullRequestBranch{
+				SHA: sha,
+			},
+			Base: github.PullRequestBranch{
+				Ref: fakegithub.TestRef,
+			},
+		}
+
+		if err := handleGenericComment(fghc, c, makeFakeRepoOwnersClient(), logrus.WithField("plugin", PluginName), &test.commentEvent, []string{labels.Approved, labels.LGTM}, plugins.Trigger{}, false, &fakePruner{}); err != nil {
+			t.Fatalf("Handle PR: %v", err)
+		}
+		if !test.shouldLabel && IssueLabelsAddedContain(fghc.IssueLabelsAdded, labels.InvalidOwners) {
+			t.Errorf("%s: didn't expect label %s in %s", test.name, labels.InvalidOwners, fghc.IssueLabelsAdded)
+			continue
+		} else if test.shouldLabel && !IssueLabelsAddedContain(fghc.IssueLabelsAdded, labels.InvalidOwners) {
+			t.Errorf("%s: expected label %s in %s", test.name, labels.InvalidOwners, fghc.IssueLabelsAdded)
+			continue
+		}
+	}
+
 }

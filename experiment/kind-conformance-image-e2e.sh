@@ -20,7 +20,12 @@ set -o xtrace
 
 # set a fixed version so that users of this script manually upgrade kind
 # in a controlled fashion along with the script contents (config, flags...)
-STABLE_KIND_VERSION=v0.4.0
+#
+# NOTE: temporarily we are using a specific HEAD commit so that we
+# - get some fixes related to Kubernetes's build changing
+# - don't get surprised when kind changes between now and the next stable release
+# We should switch back to a release tag at the next release.
+STABLE_KIND_VERSION=v0.6.0
 
 # our exit handler (trap)
 cleanup() {
@@ -43,12 +48,9 @@ cleanup() {
 install_kind() {
     # install `kind` to tempdir
     TMP_DIR=$(mktemp -d)
-    # ensure bin dir
-    mkdir -p "${TMP_DIR}/bin"
-    pushd "${TMP_DIR}"
-    env "GOPATH=${TMP_DIR}" GO111MODULE="on" go get -u "sigs.k8s.io/kind@${STABLE_KIND_VERSION}"
-    popd
-    PATH="${TMP_DIR}/bin:${PATH}"
+    curl -sLo "${TMP_DIR}/kind" https://github.com/kubernetes-sigs/kind/releases/download/${STABLE_KIND_VERSION}/kind-linux-amd64
+    chmod +x "${TMP_DIR}/kind"
+    PATH="${TMP_DIR}:${PATH}"
     export PATH
 }
 
@@ -95,6 +97,10 @@ EOF
     # mark the cluster as up for cleanup
     # even if kind create fails, kind delete can clean up after it
     KIND_IS_UP=true
+
+    KUBECONFIG="${HOME}/.kube/kind-config-default"
+    export KUBECONFIG
+
     # actually create, with:
     # - do not delete created nodes from a failed cluster create (for debugging)
     # - wait up to one minute for the nodes to be "READY"
@@ -126,8 +132,6 @@ run_tests() {
 
   VERSION=$(echo -n "${KUBE_GIT_VERSION}" | cut -f 1 -d '+')
   export VERSION
-  KUBECONFIG=$(kind get kubeconfig-path)
-  export KUBECONFIG
 
   pushd ${PWD}/cluster/images/conformance
 

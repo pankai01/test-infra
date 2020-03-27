@@ -4,13 +4,16 @@ presubmits:
     always_run: true
     skip_report: false
     max_concurrency: 12
-    branches:
-    - master
+    skip_branches:
+    - release-\d+\.\d+  # per-release image
     labels:
       preset-service-account: "true"
       preset-k8s-ssh: "true"
       preset-bazel-scratch-dir: "true"
       preset-e2e-scalability-common: "true"
+      preset-e2e-scalability-presubmits: "true"
+    annotations:
+      fork-per-release: "true"
     spec:
       containers:
       - args:
@@ -26,7 +29,7 @@ presubmits:
         - --cluster=
         - --extract=local
         - --gcp-nodes=100
-        - --gcp-project=k8s-presubmit-scale
+        - --gcp-project-type=scalability-presubmit-project
         - --gcp-zone=us-east1-b
         - --provider=gce
         - --stage=gs://kubernetes-release-pull/ci/pull-kubernetes-e2e-gce-100-performance
@@ -39,15 +42,21 @@ presubmits:
         - --test-cmd-args=--report-dir=/workspace/_artifacts
         - --test-cmd-args=--testconfig=testing/density/config.yaml
         - --test-cmd-args=--testconfig=testing/load/config.yaml
-        - --test-cmd-args=--testoverrides=./testing/density/100_nodes/override.yaml
+        - --test-cmd-args=--testconfig=testing/access-tokens/config.yaml
+        - --test-cmd-args=--testoverrides=./testing/experiments/enable_prometheus_api_responsiveness.yaml
+        - --test-cmd-args=--testoverrides=./testing/experiments/enable_restart_count_check.yaml
+        - --test-cmd-args=--testoverrides=./testing/experiments/use_simple_latency_query.yaml
+        - --test-cmd-args=--testoverrides=./testing/load/experimental/overrides/enable_configmaps.yaml
+        - --test-cmd-args=--testoverrides=./testing/load/experimental/overrides/enable_daemonsets.yaml
+        - --test-cmd-args=--testoverrides=./testing/load/experimental/overrides/enable_jobs.yaml
+        - --test-cmd-args=--testoverrides=./testing/load/experimental/overrides/enable_pvs.yaml
+        - --test-cmd-args=--testoverrides=./testing/load/experimental/overrides/enable_secrets.yaml
+        - --test-cmd-args=--testoverrides=./testing/load/experimental/overrides/enable_statefulsets.yaml
         - --test-cmd-args=--testoverrides=./testing/load/gce/throughput_override.yaml
-        - --test-cmd-args=--testoverrides=./testing/prometheus/scrape-etcd.yaml
-        - --test-cmd-args=--testoverrides=./testing/prometheus/scrape-kube-proxy.yaml
-        - --test-cmd-args=--testoverrides=./testing/experiments/probes.yaml
         - --test-cmd-name=ClusterLoaderV2
         - --timeout=100m
         - --use-logexporter
-        image: gcr.io/k8s-testimages/kubekins-e2e:v20190719-7cdf877-master
+        image: gcr.io/k8s-testimages/kubekins-e2e:v20200326-e946722-master
         resources:
           requests:
             memory: "6Gi"
@@ -62,6 +71,7 @@ presubmits:
       preset-k8s-ssh: "true"
       preset-bazel-scratch-dir: "true"
       preset-e2e-scalability-common: "true"
+      preset-e2e-scalability-presubmits: "true"
     spec:
       containers:
       - args:
@@ -78,8 +88,8 @@ presubmits:
         - --env=HEAPSTER_MACHINE_TYPE=n1-standard-4
         - --extract=local
         - --gcp-nodes=500
-        - --gcp-project=k8s-scale-testing
-        - --gcp-zone=us-east1-a
+        - --gcp-project=k8s-presubmit-scale
+        - --gcp-zone=us-east1-b
         - --provider=gce
         - --stage=gs://kubernetes-release-pull/ci/pull-kubernetes-e2e-gce-big-performance
         - --tear-down-previous
@@ -91,11 +101,12 @@ presubmits:
         - --test-cmd-args=--report-dir=/workspace/_artifacts
         - --test-cmd-args=--testconfig=testing/density/config.yaml
         - --test-cmd-args=--testconfig=testing/load/config.yaml
-        - --test-cmd-args=--testoverrides=./testing/prometheus/scrape-etcd.yaml
+        - --test-cmd-args=--testconfig=testing/access-tokens/config.yaml
+        - --test-cmd-args=--testoverrides=./testing/experiments/enable_prometheus_api_responsiveness.yaml
         - --test-cmd-name=ClusterLoaderV2
         - --timeout=240m
         - --use-logexporter
-        image: gcr.io/k8s-testimages/kubekins-e2e:v20190719-7cdf877-master
+        image: gcr.io/k8s-testimages/kubekins-e2e:v20200326-e946722-master
         resources:
           requests:
             memory: "6Gi"
@@ -110,6 +121,7 @@ presubmits:
       preset-k8s-ssh: "true"
       preset-bazel-scratch-dir: "true"
       preset-e2e-scalability-common: "true"
+      preset-e2e-scalability-presubmits: "true"
     spec:
       containers:
       - args:
@@ -126,8 +138,8 @@ presubmits:
         - --env=HEAPSTER_MACHINE_TYPE=n1-standard-8
         - --extract=local
         - --gcp-nodes=2000
-        - --gcp-project=k8s-scale-testing
-        - --gcp-zone=us-east1-a
+        - --gcp-project=k8s-presubmit-scale
+        - --gcp-zone=us-east1-b
         - --provider=gce
         - --stage=gs://kubernetes-release-pull/ci/pull-kubernetes-e2e-gce-large-performance
         - --test=false
@@ -139,12 +151,13 @@ presubmits:
         - --test-cmd-args=--report-dir=/workspace/_artifacts
         - --test-cmd-args=--testconfig=testing/density/config.yaml
         - --test-cmd-args=--testconfig=testing/load/config.yaml
+        - --test-cmd-args=--testconfig=testing/access-tokens/config.yaml
         - --test-cmd-args=--testoverrides=./testing/density/2000_nodes/override.yaml
-        - --test-cmd-args=--testoverrides=./testing/prometheus/scrape-etcd.yaml
+        - --test-cmd-args=--testoverrides=./testing/experiments/enable_prometheus_api_responsiveness.yaml
         - --test-cmd-name=ClusterLoaderV2
         - --timeout=540m
         - --use-logexporter
-        image: gcr.io/k8s-testimages/kubekins-e2e:v20190719-7cdf877-master
+        image: gcr.io/k8s-testimages/kubekins-e2e:v20200326-e946722-master
         resources:
           requests:
             memory: "6Gi"
@@ -161,11 +174,13 @@ presubmits:
       preset-bazel-scratch-dir: "true"
       preset-dind-enabled: "true"
       preset-e2e-kubemark-common: "true"
+      preset-e2e-scalability-presubmits: "true"
     annotations:
       fork-per-release: "true"
+      testgrid-create-test-group: "true"
     spec:
       containers:
-      - image: gcr.io/k8s-testimages/kubekins-e2e:v20190719-7cdf877-master
+      - image: gcr.io/k8s-testimages/kubekins-e2e:v20200326-e946722-master
         args:
         - --root=/go/src
         - "--job=$(JOB_NAME)"
@@ -183,7 +198,7 @@ presubmits:
         - --gcp-master-size=n1-standard-4
         - --gcp-node-size=n1-standard-8
         - --gcp-nodes=7
-        - --gcp-project=k8s-presubmit-scale
+        - --gcp-project-type=scalability-presubmit-project
         - --gcp-zone=us-east1-b
         - --kubemark
         - --kubemark-nodes=500
@@ -199,9 +214,21 @@ presubmits:
         - --test-cmd-args=--report-dir=/workspace/_artifacts
         - --test-cmd-args=--testconfig=testing/density/config.yaml
         - --test-cmd-args=--testconfig=testing/load/config.yaml
+        - --test-cmd-args=--testconfig=testing/access-tokens/config.yaml
+        - --test-cmd-args=--testoverrides=./testing/experiments/enable_prometheus_api_responsiveness.yaml
+        - --test-cmd-args=--testoverrides=./testing/experiments/enable_restart_count_check.yaml
+        - --test-cmd-args=--testoverrides=./testing/experiments/use_simple_latency_query.yaml
+        - --test-cmd-args=--testoverrides=./testing/load/experimental/overrides/enable_configmaps.yaml
+        - --test-cmd-args=--testoverrides=./testing/load/experimental/overrides/enable_daemonsets.yaml
+        - --test-cmd-args=--testoverrides=./testing/load/experimental/overrides/enable_jobs.yaml
+        # TODO(https://github.com/kubernetes/perf-tests/issues/803): Re-enable
+        # - --test-cmd-args=--testoverrides=./testing/load/experimental/overrides/enable_pvs.yaml
+        - --test-cmd-args=--testoverrides=./testing/load/experimental/overrides/enable_secrets.yaml
+        - --test-cmd-args=--testoverrides=./testing/load/experimental/overrides/enable_statefulsets.yaml
         - --test-cmd-args=--testoverrides=./testing/load/kubemark/500_nodes/override.yaml
         - --test-cmd-name=ClusterLoaderV2
         - --timeout=100m
+        - --use-logexporter
         # TODO(krzyzacy): Figure out bazel built kubemark image
         #env:
         # - name: KUBEMARK_BAZEL_BUILD
@@ -224,9 +251,10 @@ presubmits:
       preset-dind-enabled: "true"
       preset-e2e-kubemark-common: "true"
       preset-e2e-kubemark-gce-scale: "true"
+      preset-e2e-scalability-presubmits: "true"
     spec:
       containers:
-      - image: gcr.io/k8s-testimages/kubekins-e2e:v20190719-7cdf877-master
+      - image: gcr.io/k8s-testimages/kubekins-e2e:v20200326-e946722-master
         args:
         - --root=/go/src
         - "--job=$(JOB_NAME)"
@@ -238,12 +266,12 @@ presubmits:
         - "--timeout=1220"
         - --scenario=kubernetes_e2e
         - --
-        - --build
+        - --build=bazel
         - --cluster=
         - --extract=local
         - --gcp-node-size=n1-standard-8
-        - --gcp-nodes=82
-        - --gcp-project=k8s-scale-testing
+        - --gcp-nodes=84
+        - --gcp-project=k8s-presubmit-scale
         - --gcp-zone=us-east1-b
         - --kubemark
         - --kubemark-nodes=5000
@@ -258,8 +286,11 @@ presubmits:
         - --test-cmd-args=--report-dir=/workspace/_artifacts
         - --test-cmd-args=--testconfig=testing/density/config.yaml
         - --test-cmd-args=--testconfig=testing/load/config.yaml
+        - --test-cmd-args=--testconfig=testing/access-tokens/config.yaml
+        - --test-cmd-args=--testoverrides=./testing/experiments/enable_prometheus_api_responsiveness.yaml
         - --test-cmd-name=ClusterLoaderV2
         - --timeout=1200m
+        - --use-logexporter
         # TODO(krzyzacy): Figure out bazel built kubemark image
         #env:
         # - name: KUBEMARK_BAZEL_BUILD
@@ -267,12 +298,14 @@ presubmits:
         resources:
           requests:
             memory: "6Gi"
+        securityContext:
+          privileged: true # TODO(fejta): https://github.com/kubernetes/kubernetes/issues/76484
 
   kubernetes/perf-tests:
   - name: pull-perf-tests-clusterloader2
     always_run: false
     skip_report: false
-    max_concurrency: 2
+    max_concurrency: 3
     branches:
     - master
     labels:
@@ -280,6 +313,7 @@ presubmits:
       preset-k8s-ssh: "true"
       preset-bazel-scratch-dir: "true"
       preset-e2e-scalability-common: "true"
+      preset-e2e-scalability-presubmits: "true"
     run_if_changed: ^clusterloader2/.*$
     spec:
       containers:
@@ -294,7 +328,7 @@ presubmits:
         - --cluster=
         - --extract=ci/latest
         - --gcp-nodes=100
-        - --gcp-project=k8s-presubmit-scale
+        - --gcp-project-type=scalability-presubmit-project
         - --gcp-zone=us-east1-b
         - --provider=gce
         - --tear-down-previous
@@ -302,20 +336,29 @@ presubmits:
         - --test-cmd=$GOPATH/src/k8s.io/perf-tests/run-e2e.sh
         - --test-cmd-args=cluster-loader2
         - --test-cmd-args=--nodes=100
+        - --test-cmd-args=--prometheus-scrape-node-exporter
         - --test-cmd-args=--provider=gce
         - --test-cmd-args=--report-dir=/workspace/_artifacts
         - --test-cmd-args=--testconfig=testing/density/config.yaml
         - --test-cmd-args=--testconfig=testing/load/config.yaml
-        - --test-cmd-args=--testoverrides=./testing/density/100_nodes/override.yaml
+        - --test-cmd-args=--testconfig=testing/access-tokens/config.yaml
+        # TODO(jprzychodzen): Re-enable node_killer when flakiness fixed
+        #- - --test-cmd-args=--testoverrides=./testing/chaosmonkey/override.yaml
+        #- - --test-cmd-args=--testoverrides=./testing/chaosmonkey/ignore_node_killer_container_restarts_100.yaml
         - --test-cmd-args=--testoverrides=./testing/load/gce/throughput_override.yaml
-        - --test-cmd-args=--testoverrides=./testing/prometheus/scrape-etcd.yaml
-        - --test-cmd-args=--testoverrides=./testing/prometheus/scrape-kube-proxy.yaml
-        - --test-cmd-args=--testoverrides=./testing/prometheus/scrape-node-exporter.yaml
-        - --test-cmd-args=--testoverrides=./testing/experiments/probes.yaml
+        - --test-cmd-args=--testoverrides=./testing/load/experimental/overrides/enable_configmaps.yaml
+        - --test-cmd-args=--testoverrides=./testing/load/experimental/overrides/enable_daemonsets.yaml
+        - --test-cmd-args=--testoverrides=./testing/load/experimental/overrides/enable_jobs.yaml
+        - --test-cmd-args=--testoverrides=./testing/load/experimental/overrides/enable_pvs.yaml
+        - --test-cmd-args=--testoverrides=./testing/load/experimental/overrides/enable_secrets.yaml
+        - --test-cmd-args=--testoverrides=./testing/load/experimental/overrides/enable_statefulsets.yaml
+        - --test-cmd-args=--testoverrides=./testing/experiments/enable_prometheus_api_responsiveness.yaml
+        - --test-cmd-args=--testoverrides=./testing/experiments/enable_restart_count_check.yaml
+        - --test-cmd-args=--testoverrides=./testing/experiments/use_simple_latency_query.yaml
         - --test-cmd-name=ClusterLoaderV2
         - --timeout=100m
         - --use-logexporter
-        image: gcr.io/k8s-testimages/kubekins-e2e:v20190719-7cdf877-master
+        image: gcr.io/k8s-testimages/kubekins-e2e:v20200326-e946722-master
         resources:
           requests:
             memory: "6Gi"
@@ -323,7 +366,7 @@ presubmits:
   - name: pull-perf-tests-clusterloader2-kubemark
     always_run: false
     skip_report: false
-    max_concurrency: 2
+    max_concurrency: 3
     branches:
       - master
     labels:
@@ -332,6 +375,7 @@ presubmits:
       preset-bazel-scratch-dir: "true"
       preset-dind-enabled: "true"
       preset-e2e-kubemark-common: "true"
+      preset-e2e-scalability-presubmits: "true"
     run_if_changed: ^clusterloader2/.*$
     spec:
       containers:
@@ -346,31 +390,74 @@ presubmits:
             - --
             - --cluster=
             - --extract=ci/latest
-            - --gcp-master-size=n1-standard-4
-            - --gcp-node-size=n1-standard-8
-            - --gcp-nodes=7
-            - --gcp-project=k8s-presubmit-scale
+            - --gcp-master-size=n1-standard-2
+            - --gcp-node-size=n1-standard-4
+            - --gcp-nodes=4
+            - --gcp-project-type=scalability-presubmit-project
             - --gcp-zone=us-east1-b
             - --kubemark
-            - --kubemark-nodes=500
+            - --kubemark-nodes=100
             - --provider=gce
             - --tear-down-previous
             - --test=false
             - --test_args=--ginkgo.focus=xxxx
             - --test-cmd=$GOPATH/src/k8s.io/perf-tests/run-e2e.sh
             - --test-cmd-args=cluster-loader2
-            - --test-cmd-args=--nodes=500
+            - --test-cmd-args=--nodes=100
+            - --test-cmd-args=--prometheus-scrape-node-exporter
             - --test-cmd-args=--provider=kubemark
             - --test-cmd-args=--report-dir=/workspace/_artifacts
             - --test-cmd-args=--testconfig=testing/density/config.yaml
             - --test-cmd-args=--testconfig=testing/load/config.yaml
-            - --test-cmd-args=--testoverrides=./testing/load/kubemark/500_nodes/override.yaml
-            - --test-cmd-args=--testoverrides=./testing/prometheus/scrape-node-exporter.yaml
+            - --test-cmd-args=--testconfig=testing/access-tokens/config.yaml
+            - --test-cmd-args=--testoverrides=./testing/load/kubemark/throughput_override.yaml
+            - --test-cmd-args=--testoverrides=./testing/load/experimental/overrides/enable_configmaps.yaml
+            - --test-cmd-args=--testoverrides=./testing/load/experimental/overrides/enable_daemonsets.yaml
+            - --test-cmd-args=--testoverrides=./testing/load/experimental/overrides/enable_jobs.yaml
+            # TODO(https://github.com/kubernetes/perf-tests/issues/803): Re-enable
+            #- --test-cmd-args=--testoverrides=./testing/load/experimental/overrides/enable_pvs.yaml
+            - --test-cmd-args=--testoverrides=./testing/load/experimental/overrides/enable_secrets.yaml
+            - --test-cmd-args=--testoverrides=./testing/load/experimental/overrides/enable_statefulsets.yaml
+            - --test-cmd-args=--testoverrides=./testing/experiments/enable_prometheus_api_responsiveness.yaml
+            - --test-cmd-args=--testoverrides=./testing/experiments/enable_restart_count_check.yaml
+            - --test-cmd-args=--testoverrides=./testing/experiments/use_simple_latency_query.yaml
             - --test-cmd-name=ClusterLoaderV2
             - --timeout=100m
-          image: gcr.io/k8s-testimages/kubekins-e2e:v20190719-7cdf877-master
+            - --use-logexporter
+          image: gcr.io/k8s-testimages/kubekins-e2e:v20200326-e946722-master
           resources:
             requests:
               memory: "6Gi"
           securityContext:
             privileged: true
+
+  - name: pull-perf-tests-util-images
+    always_run: false
+    skip_report: false
+    max_concurrency: 10
+    run_if_changed: ^util-images/.*$
+    branches:
+      - master
+    labels:
+      preset-service-account: "true"
+      preset-dind-enabled: "true"
+    annotations:
+      testgrid-dashboards: presubmits-kubernetes-scalability
+      testgrid-tab-name: pull-perf-tests-util-images
+    spec:
+      containers:
+        - image: gcr.io/k8s-testimages/bootstrap:v20200324-0132e79
+          args:
+          - --root=/go/src
+          - --repo=k8s.io/$(REPO_NAME)=$(PULL_REFS)
+          - --timeout=60
+          - --scenario=execute
+          - --
+          - /go/src/k8s.io/perf-tests/util-images/presubmit.sh
+          # docker-in-docker needs privileged mode
+          securityContext:
+            privileged: true
+          resources:
+            requests:
+              cpu: 1
+              memory: "2Gi"

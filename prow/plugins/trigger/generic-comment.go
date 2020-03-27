@@ -40,20 +40,6 @@ func handleGenericComment(c Client, trigger plugins.Trigger, gc github.GenericCo
 	if gc.Action != github.GenericCommentActionCreated || !gc.IsPR || gc.IssueState != "open" {
 		return nil
 	}
-	// Skip comments not germane to this plugin
-	if !pjutil.RetestRe.MatchString(gc.Body) && !pjutil.OkToTestRe.MatchString(gc.Body) && !pjutil.TestAllRe.MatchString(gc.Body) {
-		matched := false
-		for _, presubmit := range c.Config.Presubmits[gc.Repo.FullName] {
-			matched = matched || presubmit.TriggerMatches(gc.Body)
-			if matched {
-				break
-			}
-		}
-		if !matched {
-			c.Logger.Debug("Comment doesn't match any triggering regex, skipping.")
-			return nil
-		}
-	}
 
 	// Skip bot comments.
 	botName, err := c.GitHubClient.BotName()
@@ -65,13 +51,25 @@ func handleGenericComment(c Client, trigger plugins.Trigger, gc github.GenericCo
 		return nil
 	}
 
-	pr, err := c.GitHubClient.GetPullRequest(org, repo, number)
-	if err != nil {
-		return err
+	refGetter := config.NewRefGetterForGitHubPullRequest(c.GitHubClient, org, repo, number)
+	presubmits := getPresubmits(c.Logger, c.GitClient, c.Config, org+"/"+repo, refGetter.BaseSHA, refGetter.HeadSHA)
+	// Skip comments not germane to this plugin
+	if !pjutil.RetestRe.MatchString(gc.Body) && !pjutil.OkToTestRe.MatchString(gc.Body) && !pjutil.TestAllRe.MatchString(gc.Body) {
+		matched := false
+		for _, presubmit := range presubmits {
+			matched = matched || presubmit.TriggerMatches(gc.Body)
+			if matched {
+				break
+			}
+		}
+		if !matched {
+			c.Logger.Debug("Comment doesn't match any triggering regex, skipping.")
+			return nil
+		}
 	}
 
 	// Skip untrusted users comments.
-	trusted, err := TrustedUser(c.GitHubClient, trigger, commentAuthor, org, repo)
+	trusted, err := TrustedUser(c.GitHubClient, trigger.OnlyOrgMembers, trigger.TrustedOrg, commentAuthor, org, repo)
 	if err != nil {
 		return fmt.Errorf("error checking trust of %s: %v", commentAuthor, err)
 	}
@@ -110,11 +108,20 @@ func handleGenericComment(c Client, trigger plugins.Trigger, gc github.GenericCo
 		}
 	}
 
-	toTest, toSkip, err := FilterPresubmits(HonorOkToTest(trigger), c.GitHubClient, gc.Body, pr, c.Config.Presubmits[gc.Repo.FullName], c.Logger)
+	pr, err := refGetter.PullRequest()
 	if err != nil {
 		return err
 	}
-	return RunAndSkipJobs(c, pr, toTest, toSkip, gc.GUID, trigger.ElideSkippedContexts)
+	baseSHA, err := refGetter.BaseSHA()
+	if err != nil {
+		return err
+	}
+
+	toTest, toSkip, err := FilterPresubmits(HonorOkToTest(trigger), c.GitHubClient, gc.Body, pr, presubmits, c.Logger)
+	if err != nil {
+		return err
+	}
+	return RunAndSkipJobs(c, pr, baseSHA, toTest, toSkip, gc.GUID, *trigger.ElideSkippedContexts)
 }
 
 func HonorOkToTest(trigger plugins.Trigger) bool {

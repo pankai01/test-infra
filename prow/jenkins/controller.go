@@ -25,6 +25,8 @@ import (
 	"github.com/bwmarrin/snowflake"
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ktypes "k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/clock"
 	prowv1 "k8s.io/test-infra/prow/client/clientset/versioned/typed/prowjobs/v1"
 
 	prowapi "k8s.io/test-infra/prow/apis/prowjobs/v1"
@@ -38,7 +40,7 @@ import (
 type prowJobClient interface {
 	Create(*prowapi.ProwJob) (*prowapi.ProwJob, error)
 	List(opts metav1.ListOptions) (*prowapi.ProwJobList, error)
-	Update(*prowapi.ProwJob) (*prowapi.ProwJob, error)
+	Patch(name string, pt ktypes.PatchType, data []byte, subresources ...string) (result *prowapi.ProwJob, err error)
 }
 
 type jenkinsClient interface {
@@ -68,6 +70,8 @@ type Controller struct {
 	cfg           config.Getter
 	node          *snowflake.Node
 	totURL        string
+	// if skip report job results to github
+	skipReport bool
 	// selector that will be applied on prowjobs.
 	selector string
 
@@ -78,11 +82,12 @@ type Controller struct {
 
 	pjLock sync.RWMutex
 	// shared across the controller and a goroutine that gathers metrics.
-	pjs []prowapi.ProwJob
+	pjs   []prowapi.ProwJob
+	clock clock.Clock
 }
 
 // NewController creates a new Controller from the provided clients.
-func NewController(prowJobClient prowv1.ProwJobInterface, jc *Client, ghc github.Client, logger *logrus.Entry, cfg config.Getter, totURL, selector string) (*Controller, error) {
+func NewController(prowJobClient prowv1.ProwJobInterface, jc *Client, ghc github.Client, logger *logrus.Entry, cfg config.Getter, totURL, selector string, skipReport bool) (*Controller, error) {
 	n, err := snowflake.NewNode(1)
 	if err != nil {
 		return nil, err
@@ -99,7 +104,9 @@ func NewController(prowJobClient prowv1.ProwJobInterface, jc *Client, ghc github
 		selector:      selector,
 		node:          n,
 		totURL:        totURL,
+		skipReport:    skipReport,
 		pendingJobs:   make(map[string]int),
+		clock:         clock.RealClock{},
 	}, nil
 }
 
@@ -214,12 +221,15 @@ func (c *Controller) Sync() error {
 	}
 
 	var reportErrs []error
-	reportTemplate := c.config().ReportTemplate
-	reportTypes := c.cfg().GitHubReporter.JobTypesToReport
-	for report := range reportCh {
-		if err := reportlib.Report(c.ghc, reportTemplate, report, reportTypes); err != nil {
-			reportErrs = append(reportErrs, err)
-			c.log.WithFields(pjutil.ProwJobFields(&report)).WithError(err).Warn("Failed to report ProwJob status")
+	if !c.skipReport {
+		reportTypes := c.cfg().GitHubReporter.JobTypesToReport
+		jConfig := c.config()
+		for report := range reportCh {
+			reportTemplate := jConfig.ReportTemplateForRepo(report.Spec.Refs)
+			if err := reportlib.Report(c.ghc, reportTemplate, report, reportTypes); err != nil {
+				reportErrs = append(reportErrs, err)
+				c.log.WithFields(pjutil.ProwJobFields(&report)).WithError(err).Warn("Failed to report ProwJob status")
+			}
 		}
 	}
 
@@ -278,7 +288,7 @@ func (c *Controller) terminateDupes(pjs []prowapi.ProwJob, jbs map[string]Build)
 		toCancel := pjs[cancelIndex]
 		// Allow aborting presubmit jobs for commits that have been superseded by
 		// newer commits in GitHub pull requests.
-		if c.config().AllowCancellations {
+		if ac := c.config().AllowCancellations; ac == nil || *ac {
 			build, buildExists := jbs[toCancel.ObjectMeta.Name]
 			// Avoid cancelling enqueued builds.
 			if buildExists && build.IsEnqueued() {
@@ -291,13 +301,14 @@ func (c *Controller) terminateDupes(pjs []prowapi.ProwJob, jbs map[string]Build)
 				}
 			}
 		}
+		srcPJ := toCancel.DeepCopy()
 		toCancel.SetComplete()
 		prevState := toCancel.Status.State
 		toCancel.Status.State = prowapi.AbortedState
 		c.log.WithFields(pjutil.ProwJobFields(&toCancel)).
 			WithField("from", prevState).
 			WithField("to", toCancel.Status.State).Info("Transitioning states.")
-		npj, err := c.prowJobClient.Update(&toCancel)
+		npj, err := pjutil.PatchProwjob(c.prowJobClient, c.log, *srcPJ, toCancel)
 		if err != nil {
 			return err
 		}
@@ -336,8 +347,8 @@ func syncProwJobs(
 }
 
 func (c *Controller) syncPendingJob(pj prowapi.ProwJob, reports chan<- prowapi.ProwJob, jbs map[string]Build) error {
-	// Record last known state so we can log state transitions.
-	prevState := pj.Status.State
+	// Record last known state so we can patch
+	prevPJ := pj.DeepCopy()
 
 	jb, jbExists := jbs[pj.ObjectMeta.Name]
 	if !jbExists {
@@ -389,18 +400,18 @@ func (c *Controller) syncPendingJob(pj prowapi.ProwJob, reports chan<- prowapi.P
 	}
 	// Report to GitHub.
 	reports <- pj
-	if prevState != pj.Status.State {
+	if prevPJ.Status.State != pj.Status.State {
 		c.log.WithFields(pjutil.ProwJobFields(&pj)).
-			WithField("from", prevState).
+			WithField("from", prevPJ.Status.State).
 			WithField("to", pj.Status.State).Info("Transitioning states.")
 	}
-	_, err := c.prowJobClient.Update(&pj)
+	_, err := pjutil.PatchProwjob(c.prowJobClient, c.log, *prevPJ, pj)
 	return err
 }
 
 func (c *Controller) syncTriggeredJob(pj prowapi.ProwJob, reports chan<- prowapi.ProwJob, jbs map[string]Build) error {
-	// Record last known state so we can log state transitions.
-	prevState := pj.Status.State
+	// Record last known state so we can patch
+	prevPJ := pj.DeepCopy()
 
 	if _, jbExists := jbs[pj.ObjectMeta.Name]; !jbExists {
 		// Do not start more jobs than specified.
@@ -419,24 +430,30 @@ func (c *Controller) syncTriggeredJob(pj prowapi.ProwJob, reports chan<- prowapi
 			pj.Status.URL = c.cfg().StatusErrorLink
 			pj.Status.Description = "Error starting Jenkins job."
 		} else {
+			now := metav1.NewTime(c.clock.Now())
+			pj.Status.PendingTime = &now
 			pj.Status.State = prowapi.PendingState
 			pj.Status.Description = "Jenkins job enqueued."
 		}
 	} else {
 		// If a Jenkins build already exists for this job, advance the ProwJob to Pending and
 		// it should be handled by syncPendingJob in the next sync.
+		if pj.Status.PendingTime == nil {
+			now := metav1.NewTime(c.clock.Now())
+			pj.Status.PendingTime = &now
+		}
 		pj.Status.State = prowapi.PendingState
 		pj.Status.Description = "Jenkins job enqueued."
 	}
 	// Report to GitHub.
 	reports <- pj
 
-	if prevState != pj.Status.State {
+	if prevPJ.Status.State != pj.Status.State {
 		c.log.WithFields(pjutil.ProwJobFields(&pj)).
-			WithField("from", prevState).
+			WithField("from", prevPJ.Status.State).
 			WithField("to", pj.Status.State).Info("Transitioning states.")
 	}
-	_, err := c.prowJobClient.Update(&pj)
+	_, err := pjutil.PatchProwjob(c.prowJobClient, c.log, *prevPJ, pj)
 	return err
 }
 

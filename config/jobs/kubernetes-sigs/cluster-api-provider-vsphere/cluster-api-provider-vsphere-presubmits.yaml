@@ -1,6 +1,6 @@
 presets:
 - labels:
-    preset-cluster-api-provider-vsphere-e2e-creds: "true"
+    preset-cluster-api-provider-vsphere-e2e-config: "true"
   env:
   - name: JUMPHOST
     valueFrom:
@@ -32,16 +32,13 @@ presets:
       secretKeyRef:
         name: clusterapi-provider-vsphere-ci-prow
         key: target-vm-ssh-pub
-  - name: GCR_KEY_FILE
-    valueFrom:
-      secretKeyRef:
-        name: clusterapi-provider-vsphere-ci-prow
-        key: cluster-api-vsphere-gcr-service-account
   volumeMounts:
   - name: jumphost-key
     mountPath: /root/ssh/.jumphost
   - name: bootstrapper-key
     mountPath: /root/ssh/.bootstrapper
+  - name: vpn-conf
+    mountPath: /root/.openvpn
   volumes:
   - name: jumphost-key
     secret:
@@ -57,17 +54,50 @@ presets:
       items:
       - key: bootstrapper-key
         path: bootstrapper-key
+  - name: vpn-conf
+    secret:
+      secretName: cluster-api-provider-vsphere-vpn-config
+      defaultMode: 256
+      items:
+      - key: prow.ovpn
+        path: prow.ovpn
+      - key: client.crt
+        path: client.crt
+      - key: client.key
+        path: client.key
+      - key: ca.crt
+        path: ca.crt
+      - key: tls.key
+        path: tls.key
+
+- labels:
+    preset-cluster-api-provider-vsphere-gcs-creds: "true"
+  env:
+  - name: GCR_KEY_FILE
+    value: /root/.capv/keyfile.json
+  volumes:
+  - name: cluster-api-provider-vsphere-gcs-creds
+    secret:
+      secretName: cluster-api-provider-vsphere-gcs-prow
+      items:
+      - key: keyfile.json
+        path: keyfile.json
+        mode: 288
+  volumeMounts:
+  - name: cluster-api-provider-vsphere-gcs-creds
+    mountPath: /root/.capv
+    readOnly: true
 
 presubmits:
   kubernetes-sigs/cluster-api-provider-vsphere:
   - name: pull-cluster-api-provider-vsphere-verify-fmt
     always_run: false
-    run_if_changed: '^((cmd|pkg|(vendor/github.com/mbenkmann/goformat/goformat)|(vendor/golang.org/x/tools/cmd/goimports))/)|hack/check-format\.sh'
+    run_if_changed: '^((api|cmd|config|contrib|controllers|pkg)/|Makefile|hack/check-format\.sh)'
     decorate: true
     path_alias: sigs.k8s.io/cluster-api-provider-vsphere
     spec:
       containers:
-      - image: gcr.io/k8s-testimages/kubekins-e2e:v20190719-7cdf877-master
+      - image: gcr.io/k8s-testimages/kubekins-e2e:v20200326-e946722-master
         command:
         - hack/check-format.sh
     annotations:
@@ -78,12 +108,12 @@ presubmits:
 
   - name: pull-cluster-api-provider-vsphere-verify-lint
     always_run: false
-    run_if_changed: '^((cmd|pkg|(vendor/golang.org/x/lint/golint))/)|hack/check-lint\.sh'
+    run_if_changed: '^((api|cmd|config|contrib|controllers|pkg)/|Makefile|hack/check-lint\.sh)'
     decorate: true
     path_alias: sigs.k8s.io/cluster-api-provider-vsphere
     spec:
       containers:
-      - image: gcr.io/k8s-testimages/kubekins-e2e:v20190719-7cdf877-master
+      - image: gcr.io/k8s-testimages/kubekins-e2e:v20200326-e946722-master
         command:
         - hack/check-lint.sh
     annotations:
@@ -94,12 +124,12 @@ presubmits:
 
   - name: pull-cluster-api-provider-vsphere-verify-vet
     always_run: false
-    run_if_changed: '^((cmd|pkg)/)|hack/check-vet\.sh'
+    run_if_changed: '^((api|cmd|config|contrib|controllers|pkg)/|Makefile|hack/check-vet\.sh)'
     decorate: true
     path_alias: sigs.k8s.io/cluster-api-provider-vsphere
     spec:
       containers:
-      - image: gcr.io/k8s-testimages/kubekins-e2e:v20190719-7cdf877-master
+      - image: gcr.io/k8s-testimages/kubekins-e2e:v20200326-e946722-master
         command:
         - hack/check-vet.sh
     annotations:
@@ -122,6 +152,8 @@ presubmits:
         - /md/lint
         - -i
         - vendor
+        - -i
+        - contrib/haproxy/openapi
         - .
     annotations:
       testgrid-dashboards: vmware-cluster-api-provider-vsphere, sig-cluster-lifecycle-cluster-api-provider-vsphere
@@ -147,12 +179,12 @@ presubmits:
 
   - name: pull-cluster-api-provider-vsphere-verify-crds
     always_run: false
-    run_if_changed: '^((config|pkg|vendor)/)|hack/verify-crds\.sh'
+    run_if_changed: '^((api|cmd|config|contrib|controllers|pkg)/|Makefile|hack/verify-crds\.sh)'
     decorate: true
     path_alias: sigs.k8s.io/cluster-api-provider-vsphere
     spec:
       containers:
-      - image: gcr.io/k8s-testimages/kubekins-e2e:v20190719-7cdf877-master
+      - image: gcr.io/k8s-testimages/kubekins-e2e:v20200326-e946722-master
         command:
         - hack/verify-crds.sh
     annotations:
@@ -163,21 +195,20 @@ presubmits:
 
   - name: pull-cluster-api-provider-vsphere-test
     always_run: false
-    run_if_changed: '^((cmd|config|hack|pkg|vendor)/)|Makefile|(scripts/(ci-test|fetch_ext_bins)\.sh)'
+    run_if_changed: '^((api|cmd|config|contrib|controllers|pkg|test)/|Makefile)'
     decorate: true
     path_alias: sigs.k8s.io/cluster-api-provider-vsphere
-    labels:
-      preset-service-account: "true"
     spec:
       containers:
-      - image: gcr.io/k8s-testimages/kubekins-e2e:v20190719-7cdf877-master
+      - image: gcr.io/k8s-testimages/kubekins-e2e:v20200326-e946722-master
         resources:
           requests:
             cpu: "500m"
         command:
         - runner.sh
         args:
-        - ./scripts/ci-test.sh
+        - make
+        - test
     annotations:
       testgrid-dashboards: vmware-cluster-api-provider-vsphere, sig-cluster-lifecycle-cluster-api-provider-vsphere
       testgrid-tab-name: pr-test
@@ -187,23 +218,30 @@ presubmits:
   - name: pull-cluster-api-provider-vsphere-e2e
     labels:
       preset-dind-enabled: "true"
-      preset-service-account: "true"
-      preset-cluster-api-provider-vsphere-e2e-creds: "true"
+      preset-cluster-api-provider-vsphere-e2e-config: "true"
+      preset-cluster-api-provider-vsphere-gcs-creds: "true"
+      preset-kind-volume-mounts: "true"
     always_run: false
-    run_if_changed: '^((cmd|config|pkg|(scripts/e2e)|vendor)/)|Dockerfile'
+    run_if_changed: '^((api|cmd|config|contrib|controllers|pkg|test)/|Dockerfile|Makefile|hack/e2e\.sh)'
     decorate: true
     path_alias: sigs.k8s.io/cluster-api-provider-vsphere
-    max_concurrency: 1
+    max_concurrency: 3
     spec:
       containers:
-      - image: gcr.io/k8s-testimages/kubekins-e2e:v20190719-7cdf877-master
+      - image: gcr.io/k8s-testimages/kubekins-e2e:v20200326-e946722-master
         command:
         - runner.sh
         args:
-        - ./scripts/e2e/e2e.sh
+        - ./hack/e2e.sh
         # we need privileged mode in order to do docker in docker
         securityContext:
           privileged: true
+          capabilities:
+            add: ["NET_ADMIN"]
+        resources:
+          requests:
+            cpu: "4000m"
+            memory: "6Gi"
     annotations:
       testgrid-dashboards: vmware-cluster-api-provider-vsphere, sig-cluster-lifecycle-cluster-api-provider-vsphere
       testgrid-tab-name: pr-e2e
